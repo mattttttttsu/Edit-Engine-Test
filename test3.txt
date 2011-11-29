@@ -1,0 +1,5418 @@
+// EditView.cpp
+// (c) 2003-2006 exeal
+
+#include "StdAfx.h"
+#include "EditView.h"
+#include "EditPoint.h"
+#include <limits>	// numeric_limit
+#include <algorithm>
+#include <queue>
+#include <zmouse.h>
+#include <msctf.h>
+#include "../../Manah/Utility.hpp"
+#include "../../Manah/WaitCursor.hpp"
+#ifndef ASCENSION_NO_ACTIVE_ACCESSIBILITY
+#include "../../Armaiti/DispatchImpl.hpp"
+#endif /* !ASCENSION_NO_ACTIVE_ACCESSIBILITY */
+
+using namespace Ascension;
+using namespace Ascension::BooleanOptions;
+using namespace Manah;
+using namespace Manah::Windows;
+using namespace Manah::Windows::GDI;
+using namespace Armaiti;
+using namespace std;
+using Armaiti::OLE::TextDataObject;
+
+#ifdef _DEBUG
+bool DIAGNOSE_INHERENT_DRAWING = false;	// 余計な描画を行っていないか診断するフラグ
+#endif /* _DEBUG */
+
+
+// 特定言語の入力シーケンスチェック
+namespace {
+	inline bool isRTLLanguage(LANGID id) {
+		return id == LANG_ARABIC || id == LANG_FARSI || id == LANG_HEBREW || id == LANG_SYRIAC || id == LANG_URDU;
+	}
+	inline bool isTISLanguage(LANGID id) {
+		return id == LANG_THAI /*|| id == LANG_LAO*/;
+	}
+	// タイ語。WTT 2.0 で規格化されている
+	// - http://mozart.inet.co.th/cyberclub/trin/thairef/wtt2/char-class.pdf
+	// - http://www.nectec.or.th/it-standards/keyboard_layout/thai-key.htm
+	class ThaiInputSequenceChecker {
+	public:
+		enum Mode {PASS_THROUGH, BASIC_MODE, STRICT_MODE};
+		static bool check(const char_t* first, const char_t* last, CodePoint cp, Mode mode = BASIC_MODE) {
+			if(mode == PASS_THROUGH)
+				return true;
+			return doCheck(
+				(first != last) ? getCharacterClass(last[-1]) : CTRL,	// 先行する文字が無い場合は制御文字があるとする
+				getCharacterClass((cp != 0x0E33) ? cp : 0x0E4D),		// Sara Am -> Nikhahit + Sara Aa
+				mode == STRICT_MODE);
+		}
+	private:
+		enum CharacterClass {
+			CTRL, NON, CONS,	// タイ文字ブロックの未定義文字は制御文字として扱う
+			LV, FV1, FV2, FV3, BV1, BV2,
+			BD, TONE, AD1, AD2, AD3,
+			AV1, AV2, AV3,
+			CHARCLASS_COUNT
+		};
+		static CharacterClass getCharacterClass(CodePoint cp) {
+			if(cp < 0x0020 || cp == 0x007F)			return CTRL;
+			else if(cp >= 0x0E00 && cp < 0x0E60)	return charClasses_[cp - 0x0E00];
+			else if(cp >= 0x0E60 && cp < 0x0E80)	return CTRL;
+			else									return NON;
+		}
+		static bool doCheck(CharacterClass lead, CharacterClass follow, bool strict) {
+			const char result = checkMap_[lead * CHARCLASS_COUNT + follow];
+			if(result == 'A' || result == 'C' || result == 'X')
+				return true;
+			else if(result == 'R')
+				return false;
+			else /* if(result == 'S') */
+				return !strict;
+		}
+		static const CharacterClass charClasses_[];
+		static const char checkMap_[];
+	};
+	const ThaiInputSequenceChecker::CharacterClass ThaiInputSequenceChecker::charClasses_[] = {
+		/* U+0E00 */	CTRL, CONS, CONS, CONS, CONS, CONS, CONS, CONS,
+						CONS, CONS, CONS, CONS, CONS, CONS, CONS, CONS,
+		/* U+0E10 */	CONS, CONS, CONS, CONS, CONS, CONS, CONS, CONS,
+						CONS, CONS, CONS, CONS, CONS, CONS, CONS, CONS,
+		/* U+0E20 */	CONS, CONS, CONS, CONS, FV3,  CONS, FV3,  CONS,
+						CONS, CONS, CONS, CONS, CONS, CONS, CONS, NON,
+		/* U+0E30 */	FV1,  AV2,  FV1,  FV1,  AV1,  AV3,  AV2,  AV3,
+						BV1,  BV2,  BD,   CTRL, CTRL, CTRL, CTRL, NON,
+		/* U+0E40 */	LV,   LV,   LV,   LV,   LV,   FV2,  NON,  AD2,
+						TONE, TONE, TONE, TONE, AD1,  AD1,  AD3,  NON,
+		/* U+0E50 */	NON,  NON,  NON,  NON,  NON,  NON,  NON,  NON,
+						NON,  NON,  NON,  NON,  CTRL, CTRL, CTRL, CTRL,
+	};
+	const char ThaiInputSequenceChecker::checkMap_[] =
+		/* CTRL */	"XAAAAAA" "RRRRRRRRRR"
+		/* NON */	"XAAASSA" "RRRRRRRRRR"
+		/* CONS */	"XAAAASA" "CCCCCCCCCC"
+		/* LV */	"XSASSSS" "RRRRRRRRRR"
+		/* FV1 */	"XSASASA" "RRRRRRRRRR"
+		/* FV2 */	"XAAAASA" "RRRRRRRRRR"
+		/* FV3 */	"XAAASAS" "RRRRRRRRRR"
+		/* BV1 */	"XAAAASA" "RRRCCRRRRR"
+		/* BV2 */	"XAAASSA" "RRRCRRRRRR"
+		/* BD */	"XAAASSA" "RRRRRRRRRR"
+		/* TONE */	"XAAAAAA" "RRRRRRRRRR"
+		/* AD1 */	"XAAASSA" "RRRRRRRRRR"
+		/* AD2 */	"XAAASSA" "RRRRRRRRRR"
+		/* AD3 */	"XAAASSA" "RRRRRRRRRR"
+		/* AV1 */	"XAAASSA" "RRRCCRRRRR"
+		/* AV2 */	"XAAASSA" "RRRCRRRRRR"
+		/* AV3 */	"XAAASSA" "RRRCRCRRRR"
+		;
+
+	// ベトナム語。
+	// ベトナム語の文字「クオック・グー」では12個の母音字、5個の声調記号、その他の子音を使う。
+	// ここでは声調記号の入力が <1文字の母音字>+<1文字以下の声調記号>
+	// というパターンに矛盾していないかを調べる。
+	// 独自のスクリプトを持たないため、入力ロケールがベトナム語でないときはチェックしない。
+	// 詳細は http://www.asahi-net.or.jp/~ez3k-msym/charsets/cjk-v.htm を参照
+	// (Uniscribe と同じく母音字が合成文字の場合は無視)
+	class VietnameseInputSequenceChecker {
+	public:
+		static bool check(const char_t* first, const char_t* last, CodePoint cp) {
+			if(PRIMARYLANGID(LOWORD(::GetKeyboardLayout(::GetCurrentThreadId()))) != LANG_VIETNAMESE)
+				return true;
+			else if(first < last && binary_search(toneMarks_, endof(toneMarks_), cp))
+				return binary_search(vowels_, endof(vowels_), last[-1]);
+			return true;
+		}
+	private:
+		static const CodePoint vowels_[24];
+		static const CodePoint toneMarks_[5];
+	};
+	const CodePoint VietnameseInputSequenceChecker::vowels_[24] = {
+		L'A', L'E', L'I', L'O', L'U', L'Y',
+		L'a', L'e', L'i', L'o', L'u', L'y',
+		0x00C2, 0x00CA, 0x00D4, 0x00E2, 0x00EA, 0x00F4,
+		0x0102, 0x0103, 0x01A0, 0x01A1, 0x01AF, 0x01B0,
+	};
+	const CodePoint VietnameseInputSequenceChecker::toneMarks_[5] = {0x0300, 0x0301, 0x0303, 0x309, 0x0323};
+
+	// アイヌ語。結合可能な半濁点のペアが正しいか調べるだけ
+	class AinuInputSequenceChecker {
+	public:
+		static bool check(const char_t* first, const char_t* last, CodePoint cp) {
+			return cp != 0x309A ||
+				(first < last && (last[-1] == L'セ' || last[-1] == L'ツ' || last[-1] == L'ト' || last[-1] == L'\x31F7'));
+		}
+	};
+} // namespace `anonymous'
+
+// キャレット用ビットマップの作成
+namespace {
+	// このメソッドは std::get_temporary_buffer で作成したポインタを返す
+	inline BITMAPINFO* prepareCaretBitmap(HDC dc, ushort width, ushort height) {
+		BITMAPINFO* info = get_temporary_buffer<BITMAPINFO>(
+			sizeof(BITMAPINFOHEADER) + sizeof(RGBQUAD) * width * height).first;
+		BITMAPINFOHEADER& header = info->bmiHeader;
+
+		memset(&header, 0, sizeof(BITMAPINFOHEADER));
+		header.biSize = sizeof(BITMAPINFOHEADER);
+		header.biWidth = width;
+		header.biHeight = -height;
+		header.biBitCount = sizeof(RGBQUAD) * 8;//::GetDeviceCaps(hDC, BITSPIXEL);
+		header.biPlanes = ::GetDeviceCaps(dc, PLANES);
+
+		return info;
+	}
+	// 指定色のソリッドなキャレット用のビットマップを作成
+	inline HBITMAP createSolidCaretBitmap(ushort width, ushort height, const RGBQUAD& color) {
+		HDC dc = ::GetDC(0);
+		BITMAPINFO*	info = prepareCaretBitmap(dc, width, height);
+
+		uninitialized_fill(info->bmiColors, info->bmiColors + width * height, color);
+		HBITMAP bitmap = ::CreateDIBitmap(dc, &info->bmiHeader, CBM_INIT, &info->bmiColors, info, DIB_RGB_COLORS);
+		return_temporary_buffer<BITMAPINFO>(info);
+		::ReleaseDC(0, dc);
+
+		return bitmap;
+	}
+	// RTL キャレット作成用のビットマップを作成
+	inline HBITMAP createRTLCaretBitmap(ushort height, bool thin, const RGBQUAD& color) {
+		HDC dc = ::GetDC(0);
+		const RGBQUAD white = {0x00, 0x00, 0x00, 0x00};
+		BITMAPINFO* info = prepareCaretBitmap(dc, 5, height);
+
+		assert(height > 3);
+		uninitialized_fill(info->bmiColors, info->bmiColors + 5 * height, white);
+		info->bmiColors[0] = color;
+		info->bmiColors[1] = color;
+		info->bmiColors[2] = color;
+		info->bmiColors[6] = color;
+		info->bmiColors[7] = color;
+		info->bmiColors[12] = color;
+		for(ushort i = 0; i < height; ++i) {
+			info->bmiColors[i * 5 + 3] = color;
+			if(!thin)	info->bmiColors[i * 5 + 4] = color;
+		}
+		HBITMAP	bitmap = ::CreateDIBitmap(dc, &info->bmiHeader, CBM_INIT, &info->bmiColors, info, DIB_RGB_COLORS);
+		return_temporary_buffer<BITMAPINFO>(info);
+		::ReleaseDC(0, dc);
+
+		return bitmap;
+	}
+	// タイ語、ラオ語キャレット用のビットマップを作成する
+	inline HBITMAP createTISCaretBitmap(ushort height, bool thin, const RGBQUAD& color) {
+		HDC dc = ::GetDC(0);
+		const RGBQUAD white = {0x00, 0x00, 0x00, 0x00};
+		const ushort width = max(height / 8, 3);
+		BITMAPINFO* info = prepareCaretBitmap(dc, width, height);
+
+		assert(height > 3);
+		uninitialized_fill(info->bmiColors, info->bmiColors + width * height, white);
+		for(ushort y = 0; y < height - 1; ++y) {
+			info->bmiColors[y * width] = color;
+			if(!thin)	info->bmiColors[y * width + 1] = color;
+		}
+		if(!thin)
+			for(ushort x = 2; x < width; ++x)	info->bmiColors[width * (height - 2) + x] = color;
+		for(ushort x = 0; x < width; ++x)	info->bmiColors[width * (height - 1) + x] = color;
+		HBITMAP	bitmap = ::CreateDIBitmap(dc, &info->bmiHeader, CBM_INIT, &info->bmiColors, info, DIB_RGB_COLORS);
+		return_temporary_buffer<BITMAPINFO>(info);
+		::ReleaseDC(0, dc);
+
+		return bitmap;
+	}
+} // namespace `anonymous'
+
+
+#ifndef ASCENSION_NO_ACTIVE_ACCESSIBILITY
+
+/**
+ *	@brief Ascension ビューのアクセシブルインターフェイス
+ *
+ *	IAccessible の実装については以下を参考にした:
+ *	<ul>
+ *		<li>Sara Ford の Custom Push Button</li>
+ *		<li>MSAA サーバーを実装する開発者のための実用的助言と、Mozilla による MSAA サーバーの実装方法</li>
+ *	</ul>
+ *	@see EditView::getAccessibleObject, ASCENSION_NO_ACTIVE_ACCESSIBILITY
+ */
+class EditView::AccessibleProxy :
+		virtual public EditDoc::IBufferListener,
+		public Armaiti::OLE::IDispatchImpl<
+			IAccessible, Armaiti::OLE::RegTypeLibTypeInfoHolder<&LIBID_Accessibility, &IID_IAccessible>
+		> {
+public:
+	// コンストラクタ
+	AccessibleProxy(EditView& view);
+	// メソッド
+	void	dispose();
+	// EditDoc::IBufferListener
+	void	onDeleteText(const TextRange& range);
+	void	onInsertText(const CharPos& at, const string_t& text);
+	// IUnknown
+	IMPLEMENT_UNKNOWN_MULTI_THREADED()
+	BEGIN_INTERFACE_TABLE()
+		IMPLEMENTS_LEFTMOST_INTERFACE(IAccessible)
+		IMPLEMENTS_INTERFACE(IDispatch)
+	END_INTERFACE_TABLE()
+	// IAccessible
+	STDMETHODIMP	get_accParent(IDispatch** ppdispParent);
+	STDMETHODIMP	get_accChildCount(long* pcountChildren);
+	STDMETHODIMP	get_accChild(VARIANT varChild, IDispatch** ppdispChild);
+	STDMETHODIMP	get_accName(VARIANT varChild, BSTR* pszName);
+	STDMETHODIMP	get_accValue(VARIANT varChild, BSTR* pszValue);
+	STDMETHODIMP	get_accDescription(VARIANT varChild, BSTR* pszDescription);
+	STDMETHODIMP	get_accRole(VARIANT varChild, VARIANT* pvarRole);
+	STDMETHODIMP	get_accState(VARIANT varChild, VARIANT* pvarState);
+	STDMETHODIMP	get_accHelp(VARIANT varChild, BSTR* pszHelp);
+	STDMETHODIMP	get_accHelpTopic(BSTR* pszHelpFile, VARIANT varChild, long* pidTopic);
+	STDMETHODIMP	get_accKeyboardShortcut(VARIANT varChild, BSTR* pszKeyboardShortcut);
+	STDMETHODIMP	get_accFocus(VARIANT* pvarChild);
+	STDMETHODIMP	get_accSelection(VARIANT* pvarChildren);
+	STDMETHODIMP	get_accDefaultAction(VARIANT varChild, BSTR* pszDefaultAction);
+	STDMETHODIMP	accSelect(long flagsSelect, VARIANT varChild);
+	STDMETHODIMP	accLocation(long* pxLeft, long* pyTop, long* pcxWidth, long* pcyHeight, VARIANT varChild);
+	STDMETHODIMP	accNavigate(long navDir, VARIANT varStart, VARIANT* pvarEndUpAt);
+	STDMETHODIMP	accHitTest(long xLeft, long yTop, VARIANT* pvarChild);
+	STDMETHODIMP	accDoDefaultAction(VARIANT varChild);
+	STDMETHODIMP	put_accName(VARIANT varChild, BSTR szName);
+	STDMETHODIMP	put_accValue(VARIANT varChild, BSTR szValue);
+private:
+	EditView& view_;
+	bool available_;
+	ComPtr<IAccessible> defaultServer_;
+//	enum {CHILDID_SELECTION = 1};
+};
+
+namespace {
+	class AccLib {
+	public:
+		AccLib() throw() : oleaccDLL_(::LoadLibraryA("oleacc.dll")), user32DLL_(::LoadLibraryA("user32.dll")) {
+			if(oleaccDLL_ == 0 || user32DLL_ == 0) {
+				::FreeLibrary(oleaccDLL_);
+				::FreeLibrary(user32DLL_);
+				oleaccDLL_ = user32DLL_ = 0;
+			} else {
+				accessibleObjectFromWindowPtr_ =
+					reinterpret_cast<LPFNACCESSIBLEOBJECTFROMWINDOW>(::GetProcAddress(oleaccDLL_, "AccessibleObjectFromWindow"));
+				createStdAccessibleObjectPtr_ =
+					reinterpret_cast<LPFNCREATESTDACCESSIBLEOBJECT>(::GetProcAddress(oleaccDLL_, "CreateStdAccessibleObject"));
+				lresultFromObjectPtr_ = reinterpret_cast<LPFNLRESULTFROMOBJECT>(::GetProcAddress(oleaccDLL_, "LresultFromObject"));
+				notifyWinEventPtr_ =
+					reinterpret_cast<VOID(WINAPI *)(DWORD, HWND, LONG, LONG)>(::GetProcAddress(user32DLL_, "NotifyWinEvent"));
+			}
+		}
+		~AccLib() throw() {::FreeLibrary(oleaccDLL_); ::FreeLibrary(user32DLL_);}
+		bool isAvailable() const throw() {return oleaccDLL_ != 0;}
+		HRESULT accessibleObjectFromWindow(HWND window, DWORD objectID, REFIID iid, void** object) {
+			assert(isAvailable()); return (*accessibleObjectFromWindowPtr_)(window, objectID, iid, object);}
+		void createStdAccessibleObject(HWND window, long objectID, REFIID iid, void** object) {
+			assert(isAvailable()); (*createStdAccessibleObjectPtr_)(window, objectID, iid, object);}
+		LRESULT lresultFromObject(REFIID iid, WPARAM wParam, LPUNKNOWN object) {
+			assert(isAvailable()); return (*lresultFromObjectPtr_)(iid, wParam, object);}
+		void notifyWinEvent(DWORD event, HWND window, long objectID, long childID) {
+			assert(isAvailable()); return (*notifyWinEventPtr_)(event, window, objectID, childID);}
+	private:
+		HMODULE oleaccDLL_, user32DLL_;
+		LPFNACCESSIBLEOBJECTFROMWINDOW accessibleObjectFromWindowPtr_;
+		LPFNCREATESTDACCESSIBLEOBJECT createStdAccessibleObjectPtr_;
+		LPFNLRESULTFROMOBJECT lresultFromObjectPtr_;
+		VOID(WINAPI *notifyWinEventPtr_)(DWORD, HWND, LONG, LONG);
+	} accLib;
+} // namespace @0
+
+#endif /* !ASCENSION_NO_ACTIVE_ACCESSIBILITY */
+
+
+// ClipboardRing class implementation
+/////////////////////////////////////////////////////////////////////////////
+
+/// コンストラクタ
+ClipboardRing::ClipboardRing() : limitCount_(16), maxBytes_(100 * 1024), activeItem_(static_cast<SizeType>(-1)) {
+}
+
+/**
+ *	新しいテキストを追加する。総数が上限を超えた場合は古いものが削除される
+ *	@param text	新しいテキスト。長さ1以上
+ *	@param box	矩形データか
+ */
+void ClipboardRing::add(const string_t& text, bool box) {
+	assertValid();
+	assert(!text.empty());
+
+	if(text.length() * sizeof(char_t) > maxBytes_) {
+		for_each(eventListeners_.begin(), eventListeners_.end(), mem_fun(&ClipboardRing::IEventListener::onClipboardRingDeniedAdding));
+//		for(set<ClipboardRing::IEventListener*>::iterator it = eventListeners_.begin(); it != eventListeners_.end(); ++it)
+//			(*it)->onClipboardRingDeniedAdding();
+		return;
+	}
+
+	ClipText ct;
+	ct.text = text;
+	ct.box = box;
+	datas_.push_front(ct);
+	if(datas_.size() > limitCount_)
+		datas_.pop_back();
+	activeItem_ = 0;
+	for_each(eventListeners_.begin(), eventListeners_.end(), mem_fun(&ClipboardRing::IEventListener::onClipboardRingChanged));
+//	for(set<ClipboardRing::IEventListener*>::iterator it = eventListeners_.begin(); it != eventListeners_.end(); ++it)
+//		(*it)->onClipboardRingChanged();
+}
+
+/**
+ *	イベントリスナの追加
+ *	@param eventListener 追加するイベントリスナ
+ */
+void ClipboardRing::addEventListener(ClipboardRing::IEventListener& eventListener) {
+	assertValid();
+	eventListeners_.insert(&eventListener);
+}
+
+/**
+ *	@brief アクティブなテキストの位置を返す
+ *
+ *	テキストが1つも無い場合、このメソッドは意味のある値を返さない
+ */
+ClipboardRing::SizeType ClipboardRing::getActiveItem() const throw() {
+	assertValid();
+	return activeItem_;
+}
+
+/// テキストの総数を返す
+ClipboardRing::SizeType ClipboardRing::getCount() const throw() {
+	assertValid();
+	return datas_.size();
+}
+
+/**
+ *	指定した位置のテキストを返す
+ *	@param index				取得するテキストの位置
+ *	@param text					テキスト
+ *	@param box					矩形データか
+ *	@throw std::out_of_range	@a index が有効範囲外のときスロー
+ */
+void ClipboardRing::getText(SizeType index, string_t& text, bool& box) const {
+	assertValid();
+	if(index >= datas_.size())
+		throw out_of_range("Specified index is out of range.");
+
+	list<ClipText>::const_iterator it = datas_.begin();
+	for(SizeType i = 0; i < index; ++i, ++it);
+
+	text = it->text;
+	box = it->box;
+}
+
+/**
+ *	テキスト総数の上限を設定する。溢れた分は削除される
+ *	@param limit					新しい上限値。0以外
+ *	@throw std::invalid_argument	@a limit が 0 のときスロー
+ */
+void ClipboardRing::limitCount(SizeType limit) {
+	assertValid();
+	if(limit == 0)
+		throw invalid_argument("Limit must not be zero.");
+
+	limitCount_ = limit;
+	if(datas_.size() > limitCount_) {
+		datas_.resize(limitCount_);
+		for_each(eventListeners_.begin(), eventListeners_.end(), mem_fun(&ClipboardRing::IEventListener::onClipboardRingChanged));
+//		for(set<ClipboardRing::IEventListener*>::iterator it = eventListeners_.begin(); it != eventListeners_.end(); ++it)
+//			(*it)->onClipboardRingChanged();
+	}
+}
+
+/**
+ *	指定したテキストを削除
+ *	@param index				削除するテキストの位置
+ *	@throw std::out_of_range	@a index が有効範囲外のときスロー
+ */
+void ClipboardRing::remove(SizeType index) {
+	assertValid();
+	if(index >= datas_.size())
+		throw out_of_range("Specified index is out of range.");
+
+	list<ClipText>::iterator it = datas_.begin();
+	for(SizeType i = 0; i < index; ++i, ++it);
+	datas_.erase(it);
+	if(index == datas_.size() && index == activeItem_)
+		--activeItem_;
+
+	for_each(eventListeners_.begin(), eventListeners_.end(), mem_fun(&ClipboardRing::IEventListener::onClipboardRingChanged));
+//	for(set<ClipboardRing::IEventListener*>::iterator it = eventListeners_.begin(); it != eventListeners_.end(); ++it)
+//		(*it)->onClipboardRingChanged();
+}
+
+/// 全てのテキストを削除
+void ClipboardRing::removeAll() {
+	assertValid();
+	datas_.clear();
+	for_each(eventListeners_.begin(), eventListeners_.end(), mem_fun(&ClipboardRing::IEventListener::onClipboardRingChanged));
+//	for(set<ClipboardRing::IEventListener*>::iterator it = eventListeners_.begin(); it != eventListeners_.end(); ++it)
+//		(*it)->onClipboardRingChanged();
+}
+
+/**
+ *	イベントリスナの削除
+ *	@param eventListener			削除するイベントリスナ
+ *	@throw std::invalid_argument	@a eventListener がイベントリスナとして登録されていなければスロー
+ */
+void ClipboardRing::removeEventListener(ClipboardRing::IEventListener& eventListener) {
+	assertValid();
+	set<ClipboardRing::IEventListener*>::iterator it = eventListeners_.find(&eventListener);
+	if(it == eventListeners_.end())
+		throw invalid_argument("Specified listener is not registered.");
+	eventListeners_.erase(it);
+}
+
+/**
+ *	アクティブなテキストの設定
+ *	@param index				アクティブにするテキストの位置
+ *	@throw std::out_of_range	@a index が有効範囲外のときスロー
+ */
+void ClipboardRing::setActiveItem(SizeType index) {
+	assertValid();
+	if(index >= datas_.size())
+		throw out_of_range("Specified index is out of range.");
+	activeItem_ = index;
+}
+
+
+// AutoScrollOriginMark class implementation
+/////////////////////////////////////////////////////////////////////////////
+
+const long	AutoScrollOriginMark::WINDOW_WIDTH = 28;
+
+/**
+ *	ウィンドウの作成
+ *	@param view	対象ビュー
+ *	@see		Window::create
+ */
+bool AutoScrollOriginMark::create(const EditView& view) {
+	HINSTANCE hinstance = reinterpret_cast<HINSTANCE>(static_cast<HANDLE_PTR>(::GetWindowLongPtr(getHandle(), GWLP_HINSTANCE)));
+	RECT rc = {0, 0, WINDOW_WIDTH + 1, WINDOW_WIDTH + 1};
+
+	if(!Controls::CustomControl<AutoScrollOriginMark>::create(view,
+			rc, 0, WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_POPUP, WS_EX_TOOLWINDOW))
+		return false;
+	modifyStyleEx(0, WS_EX_LAYERED);	// いきなり CreateWindowEx(WS_EX_LAYERED) とすると NT 4.0 で失敗する
+
+	HRGN rgn = ::CreateEllipticRgn(0, 0, WINDOW_WIDTH + 1, WINDOW_WIDTH + 1);
+	setWindowRgn(rgn, false);
+	::DeleteObject(rgn);
+	setLayeredWindowAttributes(::GetSysColor(COLOR_WINDOW), 0, LWA_COLORKEY);
+
+	return true;
+}
+
+/// @see Window::onPaint
+void AutoScrollOriginMark::onPaint(PaintDC& dc) {
+	const COLORREF color = ::GetSysColor(COLOR_APPWORKSPACE);
+	HPEN pen = ::CreatePen(PS_SOLID, 1, color), oldPen = dc.selectObject(pen);
+	HBRUSH brush = ::CreateSolidBrush(color), oldBrush = dc.selectObject(brush);
+	POINT points[4];
+
+	points[0].x = 13; points[0].y = 3;
+	points[1].x = 7; points[1].y = 9;
+	points[2].x = 20; points[2].y = 9;
+	points[3].x = 14; points[3].y = 3;
+	dc.polygon(points, 4);
+
+	points[0].x = 13; points[0].y = 24;
+	points[1].x = 7; points[1].y = 18;
+	points[2].x = 20; points[2].y = 18;
+	points[3].x = 14; points[3].y = 24;
+	dc.polygon(points, 4);
+
+	dc.moveTo(13, 12); dc.lineTo(15, 12);
+	dc.moveTo(12, 13); dc.lineTo(16, 13);
+	dc.moveTo(12, 14); dc.lineTo(16, 14);
+	dc.moveTo(13, 15); dc.lineTo(15, 15);
+
+	dc.selectObject(oldPen);
+	dc.selectObject(oldBrush);
+	::DeleteObject(pen);
+	::DeleteObject(brush);
+}
+
+
+// Abbreviations class implementation
+/////////////////////////////////////////////////////////////////////////////
+
+/// コンストラクタ
+Abbreviations::Abbreviations() : maxAbbreviationLength_(0) {
+}
+
+/// 指定した短縮語を展開した文字列を返す。登録されていなければ空文字列を返す
+string_t Abbreviations::expand(const string_t& abbreviation) const {
+	map<string_t, string_t>::const_iterator it = abbreviations_.find(abbreviation);
+	return (it != abbreviations_.end()) ? it->second : L"";
+}
+
+/// 登録されている短縮語のリストを返す
+void Abbreviations::getList(set<string_t>& abbreviations) const {
+	for(map<string_t, string_t>::const_iterator it = abbreviations_.begin(); it != abbreviations_.end(); ++it)
+		abbreviations.insert(it->first);
+}
+
+/**
+ *	短縮語を登録。既存のものは上書きされる
+ *	@param abbreviation				短縮語
+ *	@param expanded					展開後の文字列
+ *	@throw std::invalid_argument	いずれかの引数が空文字列のときスロー
+ */
+void Abbreviations::insert(const string_t& abbreviation, const string_t& expanded) {
+	map<string_t, string_t>::iterator it = abbreviations_.find(abbreviation);
+	if(it != abbreviations_.end())
+		abbreviations_.erase(it);
+	abbreviations_.insert(make_pair(abbreviation, expanded));
+	maxAbbreviationLength_ = max(abbreviation.length(), maxAbbreviationLength_);
+}
+
+/// 指定した短縮語を削除
+void Abbreviations::remove(const string_t& abbreviation) {
+	if(abbreviations_.erase(abbreviation) != 0) {
+		if(abbreviations_.empty())
+			maxAbbreviationLength_ = 0;
+		else if(abbreviation.length() == maxAbbreviationLength_) {
+			for(map<string_t, string_t>::const_iterator it = abbreviations_.begin(); it != abbreviations_.end(); ++it)
+				maxAbbreviationLength_ = max(abbreviation.length(), maxAbbreviationLength_);
+		}
+	}
+}
+
+/// 登録されている全ての短縮語を削除
+void Abbreviations::removeAll() {
+	abbreviations_.clear();
+}
+
+
+// EditView class implementation
+/////////////////////////////////////////////////////////////////////////////
+
+// 静的メンバ
+ClipboardRing		EditView::clipboardRing_;
+TextSearcher		EditView::textSearcher_;
+IncrementalSearcher	EditView::incrementalSearcher_;
+Abbreviations		EditView::abbreviations_;
+#ifndef ASCENSION_NO_MIGEMO
+WCHAR				EditView::migemoRuntimePath_[MAX_PATH] = L"";
+WCHAR				EditView::migemoDictionaryPath_[MAX_PATH] = L"";
+#endif /* !ASCENSION_NO_MIGEMO */
+
+/// コンストラクタ
+EditView::EditView(EditDoc& document) : View<EditDoc, DocumentUpdate>(document), tipText_(0), autoScrollOriginMark_(0),
+#ifndef ASCENSION_NO_ACTIVE_ACCESSIBILITY
+		accessibleProxy_(0),
+#endif /* !ASCENSION_NO_ACTIVE_ACCESSIBILITY */
+		clones_(new set<EditView*>), imeCompositionActivated_(false),
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+		lineBitmap_(0), oldLineBitmap_(0),
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+		leftDownMode_(LDM_NONE), nextCharVariation_(NCV_NONE),
+		mouseOperationDisabledCount_(0), firstVisibleLine_(0) {
+	getDocument().addView(*this);
+	selection_.reset(new Selection(*this));
+	originalView_ = this;	// C4345 (VC7)
+	dragging_ = new TextDataObject(*this);
+	completionWindow_.reset(new CompletionWindow(*this));
+	sharedData_ = new SharedData(*this);
+	boundaryDetector_.reset(new DocumentBoundaryDetector(getLexer(), getDocument()));
+
+	sharedData_->layoutManager.addEventListener(*this);
+	hilightedBracketPositions_[0] = hilightedBracketPositions_[1] = CharPos::INVALID_POSITION;
+	lastOperation_.type_ = EditOperation::NONE;
+}
+
+/// コピーコンストラクタ
+EditView::EditView(const EditView& rhs) : View<EditDoc, DocumentUpdate>(rhs), tipText_(0)
+#ifndef ASCENSION_NO_ACTIVE_ACCESSIBILITY
+		, accessibleProxy_(0)
+#endif /* !ASCENSION_NO_ACTIVE_ACCESSIBILITY */
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+		, lineBitmap_(0), oldLineBitmap_(0)
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+{
+	getDocument().addView(*this);
+
+	// 非共有メンバは自分で作成。共有メンバはコピー
+	selection_.reset(new Selection(*this));
+	dragging_ = new TextDataObject(*this);
+	completionWindow_.reset(new CompletionWindow(*this));
+
+	originalView_ = rhs.originalView_;
+	originalView_->clones_->insert(this);
+	sharedData_ = rhs.sharedData_;
+	boundaryDetector_.reset(new DocumentBoundaryDetector(getLexer(), getDocument()));
+
+	modeState_ = rhs.modeState_;
+
+	imeCompositionActivated_ = false;
+	leftDownMode_ = LDM_NONE;
+	nextCharVariation_ = NCV_NONE;
+	mouseOperationDisabledCount_ = 0;
+	sharedData_->layoutManager.addEventListener(*this);
+	hilightedBracketPositions_[0] = hilightedBracketPositions_[1] = CharPos::INVALID_POSITION;
+	firstVisibleLine_ = rhs.firstVisibleLine_;
+}
+
+/// デストラクタ
+EditView::~EditView() {
+	sharedData_->layoutManager.removeEventListener(*this);
+
+	// 非共有データ
+//	delete selection_;
+	delete[] tipText_;
+#ifndef ASCENSION_NO_ACTIVE_ACCESSIBILITY
+	if(accessibleProxy_ != 0)
+		accessibleProxy_->Release();
+#endif /* !ASCENSION_NO_ACTIVE_ACCESSIBILITY */
+//	delete boundaryDetector_;
+//	delete completionWindow_;
+//	delete autoScrollOriginMark_;
+
+	// 所有権
+	if(originalView_ == this) {	// 自分が複製元
+		if(clones_->empty()) {	// 自分が最後
+			delete sharedData_;	// ここで共有データを破棄する
+			delete clones_;		// クローンのリストも破壊
+		} else {	// 自分の複製がまだ残っている
+			EditView* newOriginal = *clones_->begin();	// 新しい複製元
+			clones_->erase(clones_->begin());
+			newOriginal->originalView_ = newOriginal;
+			newOriginal->clones_ = clones_;
+			for(set<EditView*>::iterator it =
+					newOriginal->clones_->begin(); it != newOriginal->clones_->end(); ++it) {
+				if(*it != newOriginal)
+					(*it)->originalView_ = newOriginal;
+			}
+		}
+	} else {	// オリジナルに死亡通知
+		set<EditView*>::iterator it = originalView_->clones_->find(this);
+		assert(it != originalView_->clones_->end());
+		originalView_->clones_->erase(it);
+	}
+}
+
+/**
+ *	@brief 処理が失敗したことをユーザに通知する
+ *
+ *	このメソッドはユーザへの通知にビープ音を使う。
+ *	システムの「サウンド表示」が設定されていれば、画面が点滅する
+ *	@see EditView::checkGuiEditability
+ */
+void EditView::beep() {
+	if(sharedData_->options.appearance[BEEP_ON_SOME_FAILURE]) {
+//		if(::GetSystemMetrics(SM_SHOWSOUNDS) == 0)
+			::MessageBeep(MB_OK);
+//		else {
+//		}
+	}
+}
+
+/// 自動スクロールの開始
+void EditView::beginAutoScroll() {
+	assertValidAsWindow();
+
+	if(!hasFocus() || getDocument().getLineCount() <= getVisibleLineCount())
+		return;
+
+	RECT	rect;
+	POINT	pt;
+
+	autoScrollOriginMark_->getWindowRect(rect);
+	::GetCursorPos(&pt);
+	autoScroll_.indicatorPosition = pt;
+	screenToClient(autoScroll_.indicatorPosition);
+	autoScrollOriginMark_->setWindowPos(HWND_TOP,
+		pt.x - (rect.right - rect.left) / 2, pt.y - (rect.bottom - rect.top) / 2,
+		0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_SHOWWINDOW);
+	autoScroll_.scrolling = true;
+	setCapture();
+	setTimer(TIMERID_AUTOSCROLL, 0, 0);
+}
+
+/**
+ *	@brief 指定した仮想ポイントに達するのに行の末尾に追加する必要のある空白文字列を返す
+ *
+ *	行の終端がすでに仮想ポイントを超えている場合は空文字列を返す。
+ *	矩形貼り付けやフリーカーソルの実装に使用
+ *	@param line		行番号 (表示行)
+ *	@param virtualX	行の左端からの位置
+ *	@return			必要な空白文字列。水平タブ (U+0009) と半角空白 (U+0020) のみで構成される
+ */
+string_t EditView::calculateSpacesReachingVirtualPoint(length_t line, ulong virtualX) const {
+	assertValidAsWindow();
+
+	const LineLayoutManager& layout = sharedData_->layoutManager;
+	ulong x = layout.getLine(line).getWidth();
+
+	if(x >= virtualX)	// すでに超えている -> 終了
+		return L"";
+
+	stringstream_t spaces;
+	ClientDC dc = const_cast<EditView*>(this)->getDC();
+	HFONT oldFont = dc.selectObject(layout.getRegularFont());
+	const long spaceWidth = dc.getTextExtent(L" ", 1).cx;
+
+	dc.selectObject(oldFont);
+
+	while(true) {	// virtualX を超えるまで水平タブを付け足していく
+		const ulong xNextTab = layout.getNextTabStop(x, true);	// TODO: 問題あり
+
+		if(xNextTab >= virtualX)
+			break;
+		spaces << L'\t';
+		x = xNextTab;
+	}
+	while(x + spaceWidth <= virtualX) {	// virtualX を超えるまで半角スペースを付け足していく
+		spaces << L' ';
+		x += spaceWidth;
+	}
+
+	return spaces.str();
+}
+
+/**
+ *	クライアント座標から最も近い行と文字位置 (いずれも論理値) を取得
+ *	@param pt				クライアント座標
+ *	@param ignoreExtenders	キャレットを受け取らない文字を無視する。
+ *							ただしサロゲートは常に考慮される
+ *	@param truncated		[out] @a pt が有効な位置に切り詰められた場合
+ *							true (null を指定すると無視される)
+ *	@return					最も近い位置。この結果はナローイングの影響を受ける
+ */
+CharPos EditView::charFromPos(const POINT& pt, bool ignoreExtenders, bool* truncated /* = 0 */) const {
+	assertValidAsWindow();
+
+	CharPos			pos;
+	const char_t*	line = 0;
+//	const length_t	lineCount = getDocument().getLineCount();
+	const EditDoc&				document = getDocument();
+	const LineLayoutManager&	layoutManager = sharedData_->layoutManager;
+	const LayoutSettings&		layout = getLayoutSetter().getSettings();
+
+	if(truncated != 0)
+		*truncated = false;
+
+	// 行の確定
+	if(pt.y <= static_cast<long>(layout.topMargin)
+			&& static_cast<ulong>(layout.topMargin - pt.y) / layoutManager.getLineHeight() > scrollInfo_.getY()) {
+		pos.line_ = 0;
+		if(truncated != 0)
+			*truncated = true;
+	} else {
+		pos.line_ = scrollInfo_.getY() +
+			static_cast<long>(pt.y - layout.topMargin) / static_cast<long>(layoutManager.getLineHeight());
+		if(pt.y < static_cast<long>(layout.topMargin) && pos.line_ > 0)
+			pos.line_ -= 1;
+	}
+/*	if(pos.line_ < scrollInfo_.getY()) {
+		pos.line_ = scrollInfo_.getY();
+		if(truncated != 0)
+			*truncated = true;
+	} else if(pos.line_ >= scrollInfo_.getY() + getVisibleLineCount()) {
+		pos.line_ = scrollInfo_.getY() + getVisibleLineCount() - 1;
+		if(truncated != 0)
+			*truncated = true;
+	}
+*/	if(pos.line_ < document.getStartPoint().line_) {
+		pos.line_ = document.getStartPoint().line_;
+		if(truncated != 0)
+			*truncated = true;
+	} else if(pos.line_ > document.getEndPoint().line_) {
+		pos.line_ = document.getEndPoint().line_;
+		if(truncated != 0)
+			*truncated = true;
+	}
+
+	// 列の確定
+	const long	marginWidth = layout.leadMargin + layoutManager.getVerticalRulerWidth();
+	RECT		clientRect;
+	if(layoutManager.getSettings().rightAlign)
+		getClientRect(clientRect);
+	if((!layoutManager.getSettings().rightAlign && pt.x > marginWidth)
+			|| (layoutManager.getSettings().rightAlign && pt.x < clientRect.right - clientRect.left - marginWidth))
+		pos.char_ = mapAbsoluteXToCharacter(pos.line_,
+			mapClientXToAbsoluteX(pt.x, layoutManager.getLine(pos.line_).getWidth()),
+			ignoreExtenders, (truncated != 0 && *truncated) ? 0 : truncated);
+	else {
+		pos.char_ = mapAbsoluteXToCharacter(pos.line_,
+			mapClientXToAbsoluteX(!layoutManager.getSettings().rightAlign ?
+				marginWidth : clientRect.right - clientRect.left - marginWidth,
+				layoutManager.getLine(pos.line_).getWidth()),
+			ignoreExtenders, (truncated != 0 && *truncated) ? 0 : truncated);
+		if(truncated != 0)
+			*truncated = true;
+	}
+	if(document.isNarrowed()) {
+		if(pos.line_ == document.getStartPoint().line_)
+			pos.char_ = max(document.getStartPoint().char_, pos.char_);
+		if(pos.line_ == document.getEndPoint().line_)
+			pos.char_ = min(document.getEndPoint().char_, pos.char_);
+	}
+
+	return logicalCharFromDisplayChar(pos);
+}
+
+/// @a pos がコメント内や引用符付き文字列内であれば真を返す
+bool EditView::charIsInCommentOrQuotation(const CharPos& pos) const {
+	// TODO: Token::OTHER_QUOTATION 対応
+	assertValid();
+
+	const length_t lineLength = getDocument().getLineLength(pos.line_);
+	const Tokens& tokens = sharedData_->layoutManager.getLine(pos.line_).getTokens();
+
+	// トークンが1つも存在しない行では注釈のみ調べて終わり
+	if(lineLength == 0 || tokens.count == 0)
+		return sharedData_->layoutManager.getLine(pos.line_).getMultilineAnnotationStatus(false) != Token::NULL_COOKIE;
+
+	// pos が行末の場合
+	int type = tokens.array[tokens.count - 1].getType();
+	if(type == Token::ANNOTATION) {
+		if(pos.char_ == getDocument().getLineLength(pos.line_))
+			return true;	// 少し問題あり
+//			return pLine->GetMultilineCommentStatus(true) != NullCookie;
+	} else if(type == Token::DOUBLE_QUOTATION || type == Token::SINGLE_QUOTATION) {
+		const string_t& line = getDocument().getLine(pos.line_);
+		if(pos.char_ == line.length()) {
+			if(lineLength - tokens.array[tokens.count - 1].getIndex() == 1)
+				return true;
+			return (type == Token::DOUBLE_QUOTATION
+					&& line[pos.char_ - 1] == L'\"'
+					&& line[pos.char_ - 2] == L'\\')
+					|| (type == Token::SINGLE_QUOTATION
+					&& line[pos.char_ - 1] == L'\''
+					&& line[pos.char_ - 2] == L'\\');
+		}
+	}
+
+	for(size_t i = 0; i < tokens.count; ++i) {
+		const Token& token = tokens.array[i];
+		if(pos.char_ >= token.getIndex()) {	// '=' を含めるかどうかは微妙だが
+			const length_t next = (i < tokens.count - 1) ? tokens.array[i + 1].getIndex() : lineLength;
+			if(pos.char_ < next) {
+				type = token.getType();
+				return type == Token::ANNOTATION
+					|| type == Token::DOUBLE_QUOTATION
+					|| type == Token::SINGLE_QUOTATION;
+			}
+		}
+	}
+	return false;
+}
+
+/// GUI ユーザの編集が可能かを返し、可能でない場合は
+/// EditView::beep の呼び出しとイベントリスナの IEditViewEventListener::onDeniedGUICommand を呼び出す
+/// @see EditView::isGUIEditable
+bool EditView::checkGUIEditability() {
+	if(isGUIEditable())
+		return true;
+	beep();
+	FOR_EACH_LISTENERS()
+		(*it)->onDeniedGUICommand();
+	return false;
+}
+
+/**
+ *	@brief アクティブポイントの文字が括弧であれば強調表示する
+ *
+ *	このメソッドは対括弧の検索、再描画、直前まで強調表示されていた対括弧の無効化など全て行う。
+ *	ナローイングでアクセス不能になったテキストの括弧は全て無視される
+ */
+void EditView::checkMatchBrackets() {
+	set<IEditViewEventListener*>::iterator it;
+
+#define FIRE_FOUND(pos)										\
+	for(it = sharedData_->eventListeners.begin();			\
+			it != sharedData_->eventListeners.end(); ++it)	\
+		(*it)->onMatchBracketFoundOutOfView(pos)
+#define FIRE_NOT_FOUND()									\
+	for(it = sharedData_->eventListeners.begin();			\
+			it != sharedData_->eventListeners.end(); ++it)	\
+		(*it)->onMatchBracketFoundOutOfView(CharPos::INVALID_POSITION)
+
+	assertValidAsWindow();
+
+	if(sharedData_->layoutManager.isTokenEnabled(ETT_MATCH_BRACKETS) && selection_->isEmpty()) {
+		const CharPos last0 = hilightedBracketPositions_[0];
+		const CharPos last1 = hilightedBracketPositions_[1];
+		const CharPos active = selection_->getActivePoint();
+		const CharPos anchor = selection_->getAnchorPoint();
+
+		// (先に) 対括弧を探す
+		CharPos bracket;
+		bool found;
+		if(found = findMatchBracket(active, bracket, true)) {
+			hilightedBracketPositions_[0] = active;
+			hilightedBracketPositions_[1] = bracket;
+		} else if(sharedData_->options.appearance[HIGHLIGHT_PREVIOUS_AS_MATCH_BRACKET]	// 1つ前も調べる
+				&& active.char_ != 0
+				&& (found = findMatchBracket(CharPos(active.line_, active.char_ - 1), bracket, true))) {
+			hilightedBracketPositions_[0] = CharPos(active.line_, active.char_ - 1);
+			hilightedBracketPositions_[1] = bracket;
+		}
+		if(found) {	// 見つかった場合
+			invalidateLine(hilightedBracketPositions_[0].line_);
+			if(!isFreezed())
+				updateWindow();
+			if(hilightedBracketPositions_[0].line_ != hilightedBracketPositions_[1].line_) {
+				invalidateLine(hilightedBracketPositions_[1].line_);
+				if(!isFreezed())
+					updateWindow();
+			}
+			if(last0 != CharPos::INVALID_POSITION
+					&& last0.line_ != hilightedBracketPositions_[0].line_
+					&& last0.line_ != hilightedBracketPositions_[1].line_) {
+				invalidateLine(last0.line_);
+				if(!isFreezed())
+					updateWindow();
+			}
+			if(last1 != CharPos::INVALID_POSITION
+					&& last1.line_ != hilightedBracketPositions_[0].line_
+					&& last1.line_ != hilightedBracketPositions_[1].line_
+					&& last1.line_ != last0.line_)
+				invalidateLine(last1.line_);
+			FIRE_NOT_FOUND();
+
+			const CharPos displayPosition = displayCharFromLogicalChar(hilightedBracketPositions_[1]);
+			const length_t visibleLineCount = getVisibleLineCount();
+			if((displayPosition.line_ < scrollInfo_.getY())	// 画面より上
+					|| (displayPosition.line_ - scrollInfo_.getY() > visibleLineCount - 1))	// 画面より下
+				FIRE_FOUND(hilightedBracketPositions_[1]);
+		} else if(last0 != CharPos::INVALID_POSITION) {	// 見つからなかった場合 -> 前回分を解除
+			hilightedBracketPositions_[0] = hilightedBracketPositions_[1] = CharPos::INVALID_POSITION;
+			invalidateLine(last0.line_);
+			if(!isFreezed())
+				updateWindow();
+			if(last0.line_ != last1.line_)
+				invalidateLine(last1.line_);
+			FIRE_NOT_FOUND();
+		}
+	} else if(hilightedBracketPositions_[0] != CharPos::INVALID_POSITION) {	// 前回分を解除するだけ
+		const length_t lastLine0 = hilightedBracketPositions_[0].line_;
+		const length_t lastLine1 = hilightedBracketPositions_[1].line_;
+
+		hilightedBracketPositions_[0] = hilightedBracketPositions_[1] = CharPos::INVALID_POSITION;
+		invalidateLine(lastLine0);
+		if(!isFreezed())
+			updateWindow();
+		if(lastLine0 != lastLine1)
+			invalidateLine(lastLine1);
+		FIRE_NOT_FOUND();
+	}
+#undef FIRE_FOUND
+#undef FIRE_NOT_FOUND
+}
+
+/// 補完ウィンドウを閉じる
+void EditView::closeCompletionWindow() {
+	if(completionWindow_->isRunning())
+		completionWindow_->abort();
+}
+
+/**
+ *	文字位置から相当列番号を取得する
+ *	@param pos	文字位置
+ *	@return		列番号
+ */
+length_t EditView::columnFromChar(const CharPos& pos) const {
+	assertValid();
+
+	const length_t line = min(pos.line_, getDocument().getLineCount() - 1);
+	const length_t column = min<length_t>(pos.char_, getDocument().getLineLength(line));
+	const LineLayout& layout = sharedData_->layoutManager.getLine(line);
+	return layout.getCaretPosition(column) / sharedData_->layoutManager.getAverageCharacterWidth();
+}
+
+/**
+ *	文字を変換する。アクセント付き文字を入力するときなどに使う
+ *	@param ch	変換する文字
+ *	@param ncv	変換の種類
+ */
+char_t EditView::convertCharacter(char_t ch, NextCharVariation ncv) {
+#define MAP_CH(x, y)	case (x): return (y)
+
+#if ASCENSION_UNICODE_VERSION != 0x0410
+#error This implementation is based on old version of Unicode.
+#endif
+
+	// .:実装メモ:.
+	// この変換規則は単純にコードポイントの名前から生成している。
+	// 例えば "A With Acute" であれば A に鋭アクセントを施して同じコードポイントが得られるとした。
+	// extender が複数存在する場合は名前の順序が重要で、"A With X And Y" であれば
+	// "A With X" に Y を施して同コードポイントが得られるが、
+	// "A With Y" に X を施した場合は "A With Y And X" が得られるものとした
+	// (以前は順序を無視していたため、結果に重複があった)
+	//
+	// この機能は将来削除予定。ビューの機能じゃないので
+	if(ncv == NCV_NONE)
+		return ch;
+	else if(ncv == NCV_GRAVE) {
+		switch(ch) {
+		MAP_CH(0x0041, 0x00C0);	MAP_CH(0x0061, 0x00E0);	// A
+		MAP_CH(0x0045, 0x00C8);	MAP_CH(0x0065, 0x00E8);	// E
+		MAP_CH(0x0049, 0x00CC);	MAP_CH(0x0069, 0x00EC);	// I
+		MAP_CH(0x004F, 0x00D2);	MAP_CH(0x006F, 0x00F2);	// O
+		MAP_CH(0x0055, 0x00D9);	MAP_CH(0x0075, 0x00F9);	// U
+		MAP_CH(0x00DC, 0x01DB);	MAP_CH(0x00FC, 0x01DC);	// U With Diaeresis
+		MAP_CH(0x004E, 0x01F8);	MAP_CH(0x006E, 0x01F9);	// N
+		MAP_CH(0x0415, 0x0400);	MAP_CH(0x0435, 0x0450);	// Cyrillic Ie
+		MAP_CH(0x0418, 0x040D);	MAP_CH(0x0438, 0x045D);	// Cyrillic I
+		MAP_CH(0x0112, 0x1E14);	MAP_CH(0x0113, 0x1E15);	// E With Macron
+		MAP_CH(0x014C, 0x1E50);	MAP_CH(0x014D, 0x1E51);	// O With Macron
+		MAP_CH(0x0057, 0x1E80);	MAP_CH(0x0077, 0x1E81);	// W
+		MAP_CH(0x00C2, 0x1EA6);	MAP_CH(0x00E2, 0x1EA7);	// A With Circumflex
+		MAP_CH(0x0102, 0x1EB0);	MAP_CH(0x0103, 0x1EB1);	// A With Breve
+		MAP_CH(0x00CA, 0x1EC0);	MAP_CH(0x00EA, 0x1EC1);	// E With Circumflex
+		MAP_CH(0x00D4, 0x1ED2);	MAP_CH(0x00F4, 0x1ED3);	// O With Circumflex
+		MAP_CH(0x01A0, 0x1EDC);	MAP_CH(0x01A1, 0x1EDD);	// O With Horn
+		MAP_CH(0x01AF, 0x1EEA);	MAP_CH(0x01B0, 0x1EEB);	// U With Horn
+		MAP_CH(0x0059, 0x1EF2);	MAP_CH(0x0079, 0x1EF3);	// Y
+		}
+	} else if(ncv == NCV_ACUTE) {
+		switch(ch) {
+		MAP_CH(0x0041, 0x00C1);	MAP_CH(0x0061, 0x00E1);	// A
+		MAP_CH(0x0045, 0x00C9);	MAP_CH(0x0065, 0x00E9);	// E
+		MAP_CH(0x0049, 0x00CD);	MAP_CH(0x0069, 0x00ED);	// I
+		MAP_CH(0x004F, 0x00D3);	MAP_CH(0x006F, 0x00F3);	// O
+		MAP_CH(0x0055, 0x00DA);	MAP_CH(0x0075, 0x00FA);	// U
+		MAP_CH(0x0059, 0x00DD);	MAP_CH(0x0079, 0x00FD);	// Y
+		MAP_CH(0x0043, 0x0106);	MAP_CH(0x0063, 0x0107);	// C
+		MAP_CH(0x004C, 0x0139);	MAP_CH(0x006C, 0x013A);	// L
+		MAP_CH(0x004E, 0x0143);	MAP_CH(0x006E, 0x0144);	// N
+		MAP_CH(0x0052, 0x0154);	MAP_CH(0x0072, 0x0155);	// R
+		MAP_CH(0x0053, 0x015A);	MAP_CH(0x0073, 0x015B);	// S
+		MAP_CH(0x005A, 0x0179);	MAP_CH(0x007A, 0x017A);	// Z
+		MAP_CH(0x00DC, 0x01D7);	MAP_CH(0x00FC, 0x01D8);	// U With Diaeresis
+		MAP_CH(0x0047, 0x01F4);	MAP_CH(0x0067, 0x01F5);	// G
+		MAP_CH(0x00C5, 0x01FA);	MAP_CH(0x00E5, 0x01FB);	// A With Ring Above
+		MAP_CH(0x00C6, 0x01FC);	MAP_CH(0x00E6, 0x01FD);	// Ae
+		MAP_CH(0x00D8, 0x01FE);	MAP_CH(0x00F8, 0x01FF);	// O With Stroke
+		MAP_CH(0x00C7, 0x1E08);	MAP_CH(0x00E7, 0x1E09);	// C With Cedilla
+		MAP_CH(0x0112, 0x1E16);	MAP_CH(0x0113, 0x1E17);	// E With Macron
+		MAP_CH(0x00CF, 0x1E2E);	MAP_CH(0x00EF, 0x1E2F);	// I With Diaeresis
+		MAP_CH(0x004B, 0x1E30);	MAP_CH(0x006B, 0x1E31);	// K
+		MAP_CH(0x004D, 0x1E3E);	MAP_CH(0x006D, 0x1E3F);	// M
+		MAP_CH(0x00D5, 0x1E4C);	MAP_CH(0x00F5, 0x1E4D);	// O With Tilde
+		MAP_CH(0x014C, 0x1E52);	MAP_CH(0x014D, 0x1E53);	// O With Macron
+		MAP_CH(0x0050, 0x1E54);	MAP_CH(0x0070, 0x1E55);	// P
+		MAP_CH(0x0168, 0x1E78);	MAP_CH(0x0169, 0x1E79);	// U With Tilde
+		MAP_CH(0x0057, 0x1E82);	MAP_CH(0x0077, 0x1E83);	// W
+		MAP_CH(0x00C2, 0x1EA4);	MAP_CH(0x00E2, 0x1EA5);	// A With Circumflex
+		MAP_CH(0x0102, 0x1EAE);	MAP_CH(0x0103, 0x1EAF);	// A With Breve
+		MAP_CH(0x00CA, 0x1EBE);	MAP_CH(0x00EA, 0x1EBF);	// E With Circumflex
+		MAP_CH(0x00D4, 0x1ED0);	MAP_CH(0x00F4, 0x1ED1);	// O With Circumflex
+		MAP_CH(0x01AF, 0x1EE8);	MAP_CH(0x01B0, 0x1EE9);	// U With Horn
+		}
+	} else if(ncv == NCV_CIRCUMFLEX) {
+		switch(ch) {
+		MAP_CH(0x0041, 0x00C2);	MAP_CH(0x0061, 0x00E2);	// A
+		MAP_CH(0x0045, 0x00CA);	MAP_CH(0x0065, 0x00EA);	// E
+		MAP_CH(0x0049, 0x00CE);	MAP_CH(0x0069, 0x00EE);	// I
+		MAP_CH(0x004F, 0x00D4);	MAP_CH(0x006F, 0x00F4);	// O
+		MAP_CH(0x0055, 0x00DB); MAP_CH(0x0075, 0x00FB);	// U
+		MAP_CH(0x0043, 0x0108);	MAP_CH(0x0063, 0x0109);	// C
+		MAP_CH(0x0047, 0x011C);	MAP_CH(0x0067, 0x011D);	// G
+		MAP_CH(0x0048, 0x0124);	MAP_CH(0x0068, 0x0125);	// H
+		MAP_CH(0x004A, 0x0134);	MAP_CH(0x006A, 0x0135);	// J
+		MAP_CH(0x0053, 0x015C);	MAP_CH(0x0073, 0x015D);	// S
+		MAP_CH(0x0057, 0x0174);	MAP_CH(0x0077, 0x0175);	// W
+		MAP_CH(0x0059, 0x0176);	MAP_CH(0x0079, 0x0177);	// Y
+		MAP_CH(0x005A, 0x1E90);	MAP_CH(0x007A, 0x1E91);	// Z
+		}
+	} else if(ncv == NCV_TILDE) {
+		switch(ch) {
+		MAP_CH(0x0041, 0x00C3);	MAP_CH(0x0061, 0x00E3);	// A
+		MAP_CH(0x004E, 0x00D1);	MAP_CH(0x006E, 0x00F1);	// N
+		MAP_CH(0x004F, 0x00D5);	MAP_CH(0x006F, 0x00F5);	// O
+		MAP_CH(0x0049, 0x0128);	MAP_CH(0x0069, 0x0129);	// I
+		MAP_CH(0x0055, 0x0168);	MAP_CH(0x0075, 0x0169);	// U
+		MAP_CH(0x0056, 0x1E7C);	MAP_CH(0x0076, 0x1E7D);	// V
+		MAP_CH(0x00C2, 0x1EAA);	MAP_CH(0x00E2, 0x1EAB);	// A With Circumflex
+		MAP_CH(0x0102, 0x1EB4);	MAP_CH(0x0103, 0x1EB5);	// A With Breve
+		MAP_CH(0x0045, 0x1EBC);	MAP_CH(0x0065, 0x1EBD);	// E
+		MAP_CH(0x00CA, 0x1EC4);	MAP_CH(0x00EA, 0x1EC5);	// E With Circumflex
+		MAP_CH(0x00D4, 0x1ED6);	MAP_CH(0x00F4, 0x1ED7);	// O With Circumflex
+		MAP_CH(0x01A0, 0x1EE0);	MAP_CH(0x01A1, 0x1EE1);	// O With Horn
+		MAP_CH(0x01AF, 0x1EEE);	MAP_CH(0x01B0, 0x1EEF);	// U With Horn
+		MAP_CH(0x0059, 0x1EF8);	MAP_CH(0x0079, 0x1EF9);	// Y
+		}
+	} else if(ncv == NCV_MACRON) {
+		switch(ch) {
+		MAP_CH(0x0041, 0x0100);	MAP_CH(0x0061, 0x0101);	// A
+		MAP_CH(0x0045, 0x0112);	MAP_CH(0x0065, 0x0113);	// E
+		MAP_CH(0x0049, 0x012A);	MAP_CH(0x0069, 0x012B);	// I
+		MAP_CH(0x004F, 0x014C);	MAP_CH(0x006F, 0x014D);	// O
+		MAP_CH(0x0055, 0x016A);	MAP_CH(0x0075, 0x016B);	// U
+		MAP_CH(0x00DC, 0x01D5);	MAP_CH(0x00FC, 0x01D6);	// U With Diaeresis
+		MAP_CH(0x00C4, 0x01DE);	MAP_CH(0x00F4, 0x01DF);	// A With Diaeresis
+		MAP_CH(0x0226, 0x01E0);	MAP_CH(0x0227, 0x01E1);	// A With Dot Above
+		MAP_CH(0x00C6, 0x01E3);	MAP_CH(0x00E6, 0x01E2);	// Ae
+		MAP_CH(0x01EA, 0x01EC);	MAP_CH(0x01EB, 0x01ED);	// O With Ogonek
+		MAP_CH(0x00D6, 0x022A);	MAP_CH(0x00F6, 0x022B);	// O With Diaeresis
+		MAP_CH(0x00D5, 0x022C);	MAP_CH(0x00F5, 0x022D);	// O With Tilde
+		MAP_CH(0x022E, 0x0230);	MAP_CH(0x022F, 0x0231);	// O With Dot Above
+		MAP_CH(0x0059, 0x0232);	MAP_CH(0x0079, 0x0233);	// Y
+		MAP_CH(0x0418, 0x04E2);	MAP_CH(0x0438, 0x04E3);	// Cyrillic I
+		MAP_CH(0x0423, 0x04EE);	MAP_CH(0x0443, 0x04EF);	// Cyrillic U
+		MAP_CH(0x0047, 0x1E20);	MAP_CH(0x0067, 0x1E21);	// G
+		MAP_CH(0x1E36, 0x1E38);	MAP_CH(0x1E37, 0x1E39);	// L With Dot Below
+		MAP_CH(0x1E5A, 0x1E5C);	MAP_CH(0x1E5B, 0x1E5D);	// R With Dot Below
+		MAP_CH(0x03B1, 0x1FB1);	MAP_CH(0x0391, 0x1FB9);	// Greek Alpha
+		MAP_CH(0x03B9, 0x1FD1);	MAP_CH(0x0399, 0x1FD9);	// Greek Iota
+		MAP_CH(0x03C5, 0x1FE1);	MAP_CH(0x03A5, 0x1FE9);	// Greek Upsilon
+		}
+	} else if(ncv == NCV_BREVE) {
+		switch(ch) {
+		MAP_CH(0x0041, 0x0102);	MAP_CH(0x0061, 0x0103);	// A
+		MAP_CH(0x0045, 0x0114);	MAP_CH(0x0065, 0x0115);	// E
+		MAP_CH(0x0047, 0x011E);	MAP_CH(0x0067, 0x011F);	// G
+		MAP_CH(0x0049, 0x012C);	MAP_CH(0x0069, 0x012D);	// I
+		MAP_CH(0x004F, 0x014E);	MAP_CH(0x006F, 0x014F);	// O
+		MAP_CH(0x0055, 0x016C);	MAP_CH(0x0075, 0x016D);	// U
+		MAP_CH(0x0416, 0x04C1);	MAP_CH(0x0436, 0x04C2);	// Cyrillic Zhe
+		MAP_CH(0x0410, 0x04D0);	MAP_CH(0x0430, 0x04D1);	// Cyrillic A
+		MAP_CH(0x0415, 0x04D6);	MAP_CH(0x0435, 0x04D7);	// Cyrillic Ie
+		MAP_CH(0x0228, 0x1E1C);	MAP_CH(0x0229, 0x1E1D);	// E With Cedilla
+		}
+	} else if(ncv == NCV_DIAERESIS) {
+		switch(ch) {
+		MAP_CH(0x0041, 0x00C4);	MAP_CH(0x0061, 0x00E4);	// A
+		MAP_CH(0x0045, 0x00CB);	MAP_CH(0x0065, 0x00EB);	// E
+		MAP_CH(0x0049, 0x00CF);	MAP_CH(0x0069, 0x00EF);	// I
+		MAP_CH(0x004F, 0x00D6);	MAP_CH(0x006F, 0x00F6);	// O
+		MAP_CH(0x0055, 0x00DC);	MAP_CH(0x0075, 0x00FC);	// U
+		MAP_CH(0x0059, 0x0178);	MAP_CH(0x0079, 0x00FF);	// Y
+		MAP_CH(0x0410, 0x04D2);	MAP_CH(0x0430, 0x04D3);	// Cyrillic A
+		MAP_CH(0x04D8, 0x04DA);	MAP_CH(0x04D9, 0x04DB);	// Cyrillic Schwa
+		MAP_CH(0x0416, 0x04DC);	MAP_CH(0x0436, 0x04DD);	// Cyrillic Zhe
+		MAP_CH(0x0417, 0x04DE);	MAP_CH(0x0437, 0x04DF);	// Cyrillic Ze
+		MAP_CH(0x0418, 0x04E4);	MAP_CH(0x0438, 0x04E5);	// Cyrillic I
+		MAP_CH(0x041E, 0x04E6);	MAP_CH(0x043E, 0x04E7);	// Cyrillic O
+		MAP_CH(0x04E8, 0x04EA);	MAP_CH(0x04E9, 0x04EB);	// Cyrillic Barred O
+		MAP_CH(0x042D, 0x04EC);	MAP_CH(0x044D, 0x04ED);	// Cyrillic E
+		MAP_CH(0x0423, 0x04F0);	MAP_CH(0x0443, 0x04F1);	// Cyrillic U
+		MAP_CH(0x0427, 0x04F4);	MAP_CH(0x0447, 0x04F5);	// Cyrillic Che
+		MAP_CH(0x042B, 0x04F8);	MAP_CH(0x044B, 0x04F9);	// Cyrillic Yeru
+		MAP_CH(0x0048, 0x1E26);	MAP_CH(0x0068, 0x1E27);	// H
+		MAP_CH(0x00D5, 0x1E4E); MAP_CH(0x00F5, 0x1E4F);	// O With Tilde
+		MAP_CH(0x016A, 0x1E7A);	MAP_CH(0x016B, 0x1E7B);	// U With Macron
+		MAP_CH(0x0057, 0x1E84);	MAP_CH(0x0077, 0x1E85);	// W
+		MAP_CH(0x0058, 0x1E8C);	MAP_CH(0x0078, 0x1E8D);	// X
+		MAP_CH(0x0074, 0x1E97);	// Small T
+		}
+	} else if(ncv == NCV_CARON) {
+		switch(ch) {
+		MAP_CH(0x0043, 0x010C);	MAP_CH(0x0063, 0x010D);	// C
+		MAP_CH(0x0044, 0x010E);	MAP_CH(0x0064, 0x010F);	// D
+		MAP_CH(0x0045, 0x011A);	MAP_CH(0x0065, 0x011B);	// E
+		MAP_CH(0x004C, 0x013D);	MAP_CH(0x006C, 0x013E);	// L
+		MAP_CH(0x004E, 0x0147);	MAP_CH(0x006E, 0x0148);	// N
+		MAP_CH(0x0052, 0x0158);	MAP_CH(0x0072, 0x0159);	// R
+		MAP_CH(0x0053, 0x0160);	MAP_CH(0x0073, 0x0161);	// S
+		MAP_CH(0x0054, 0x0164);	MAP_CH(0x0074, 0x0165);	// T
+		MAP_CH(0x005A, 0x017D);	MAP_CH(0x007A, 0x017E);	// Z
+		MAP_CH(0x0041, 0x01CD);	MAP_CH(0x0061, 0x01CE);	// A
+		MAP_CH(0x0049, 0x01CF);	MAP_CH(0x0069, 0x01D0);	// I
+		MAP_CH(0x004F, 0x01D1);	MAP_CH(0x006F, 0x01D2);	// O
+		MAP_CH(0x0055, 0x01D3);	MAP_CH(0x0075, 0x01D4);	// U
+		MAP_CH(0x00DC, 0x01D9);	MAP_CH(0x00FC, 0x01DA);	// U With Diaeresis
+		MAP_CH(0x0047, 0x01E6);	MAP_CH(0x0067, 0x01E7);	// G
+		MAP_CH(0x004B, 0x01E9);	MAP_CH(0x006B, 0x01E9);	// K
+		MAP_CH(0x01B7, 0x01EE);	MAP_CH(0x0292, 0x01EF);	// Ezh
+		MAP_CH(0x006A, 0x030C);	// Small J
+		MAP_CH(0x0048, 0x021E);	MAP_CH(0x0068, 0x021F);	// H
+		}
+	} else if(ncv == NCV_CEDILLA) {
+		switch(ch) {
+		MAP_CH(0x0043, 0x00C7);	MAP_CH(0x0063, 0x00E7);	// C
+		MAP_CH(0x0047, 0x0122);	MAP_CH(0x0067, 0x0123);	// G
+		MAP_CH(0x004B, 0x0136);	MAP_CH(0x006B, 0x0137);	// K
+		MAP_CH(0x004C, 0x013B);	MAP_CH(0x006C, 0x013C);	// L
+		MAP_CH(0x004E, 0x0145);	MAP_CH(0x006E, 0x0146);	// N
+		MAP_CH(0x0052, 0x0156);	MAP_CH(0x0072, 0x0157);	// R
+		MAP_CH(0x0053, 0x015E);	MAP_CH(0x0073, 0x015F);	// S
+		MAP_CH(0x0054, 0x0162);	MAP_CH(0x0074, 0x0163);	// T
+		MAP_CH(0x0045, 0x0228);	MAP_CH(0x0065, 0x0229);	// E
+		MAP_CH(0x0044, 0x1E10);	MAP_CH(0x0064, 0x1E11);	// D
+		MAP_CH(0x0048, 0x1E28);	MAP_CH(0x0068, 0x1E29);	// H
+		}
+	} else if(ncv == NCV_SUPERSCRIPT) {
+		switch(ch) {
+			/* super scripts */
+		MAP_CH(0x0030, 0x2070);	// 0
+		MAP_CH(0x0069, 0x2071);	// i
+		MAP_CH(0x0031, 0x00B9);	// 1
+		MAP_CH(0x0032, 0x00B2);	MAP_CH(0x0033, 0x00B3);	// 2, 3
+		MAP_CH(0x0034, 0x2074);	MAP_CH(0x0035, 0x2075);	// 4, 5
+		MAP_CH(0x0036, 0x2076);	MAP_CH(0x0037, 0x2077);	// 6, 7
+		MAP_CH(0x0038, 0x2078);	MAP_CH(0x0039, 0x2079);	// 8, 9
+		MAP_CH(0x002B, 0x207A);	MAP_CH(0x2212, 0x207B);	// +, -
+		MAP_CH(0x003D, 0x207C);	// =
+		MAP_CH(0x0028, 0x207D);	MAP_CH(0x0029, 0x207E);	// (, )
+		MAP_CH(0x006E, 0x207F);	// n
+			/* ordinal indicators  */
+//		MAP_CH(0x0061, 0x00AA);	// Feminine Ordinal Indicator
+//		MAP_CH(0x006F, 0x00BA);	// Masculine Ordinal Indicator
+			/* modifier letters */
+		MAP_CH(0x0068, 0x02B0);	MAP_CH(0x0266, 0x02B1);	// h, h With Hook
+		MAP_CH(0x006A, 0x02B2);	MAP_CH(0x0072, 0x02B3);	// j, r
+		MAP_CH(0x0279, 0x02B4);	MAP_CH(0x027B, 0x02B5);	// Turned r, Turned r With Hook
+		MAP_CH(0x0281, 0x02B6);	MAP_CH(0x0077, 0x02B7);	// Inverted R, w
+		MAP_CH(0x0079, 0x02B8);	MAP_CH(0x0263, 0x02E0);	// y, Small Gamma
+		MAP_CH(0x006C, 0x02E1);	MAP_CH(0x0073, 0x02E2);	// l, s
+		MAP_CH(0x0078, 0x02E3);	MAP_CH(0x0295, 0x02E4);	// x, Small Reversed Glottal Stop
+		MAP_CH(0x0041, 0x1D2C);	MAP_CH(0x00C6, 0x1D2D);	// A, AE
+		MAP_CH(0x0042, 0x1D2E);	MAP_CH(0x0044, 0x1D30);	// B, D
+		MAP_CH(0x0045, 0x1D31);	MAP_CH(0x0047, 0x1D33);	// E, G
+		MAP_CH(0x0048, 0x1D34);	MAP_CH(0x0049, 0x1D35);	// H, I
+		MAP_CH(0x004A, 0x1D36);	MAP_CH(0x004B, 0x1D37);	// J, K
+		MAP_CH(0x004C, 0x1D38);	MAP_CH(0x004D, 0x1D39);	// L, M
+		MAP_CH(0x004E, 0x1D3A);	MAP_CH(0x004F, 0x1D3C);	// N, O
+		MAP_CH(0x0222, 0x1D3D);	MAP_CH(0x0050, 0x1D3E);	// OU, P
+		MAP_CH(0x0052, 0x1D3F);	MAP_CH(0x0054, 0x1D40);	// R, T
+		MAP_CH(0x0055, 0x1D41);	MAP_CH(0x0057, 0x1D42);	// U, W
+		MAP_CH(0x0061, 0x1D43);	MAP_CH(0x0250, 0x1D44);	// a, turned a
+		MAP_CH(0x0251, 0x1D45);	MAP_CH(0x1D02, 0x1D46);	// alpha, turned ae
+		MAP_CH(0x0062, 0x1D47);	MAP_CH(0x0064, 0x1D48);	// b, d
+		MAP_CH(0x0065, 0x1D49);	MAP_CH(0x0259, 0x1D4A);	// e, schwa
+		MAP_CH(0x025B, 0x1D4B);	MAP_CH(0x025C, 0x1D4C);	// open e, turned open e
+		MAP_CH(0x0067, 0x1D4D);	MAP_CH(0x006B, 0x1D4E);	// g, k
+		MAP_CH(0x006D, 0x1D50);	MAP_CH(0x014B, 0x1D51);	// m, eng
+		MAP_CH(0x006F, 0x1D52);	MAP_CH(0x0254, 0x1D53);	// o, open o
+		MAP_CH(0x1D16, 0x1D54);	MAP_CH(0x1D17, 0x1D55);	// top half o, bottom half o
+		MAP_CH(0x0070, 0x1D56);	MAP_CH(0x0074, 0x1D57);	// p, t
+		MAP_CH(0x0075, 0x1D58);	MAP_CH(0x1D1D, 0x1D59);	// u, sideways u
+		MAP_CH(0x026F, 0x1D5A);	MAP_CH(0x0076, 0x1D5B);	// turned m, v
+		MAP_CH(0x1D25, 0x1D5C);	MAP_CH(0x03B2, 0x1D5D);	// ain, beta
+		MAP_CH(0x03B3, 0x1D5E);	MAP_CH(0x03B4, 0x1D5F);	// greek gamma, delta
+		MAP_CH(0x03C6, 0x1D60);	MAP_CH(0x03C7, 0x1D61);	// greek phi, chi
+			/* ideographic annotations */
+		MAP_CH(0x4E00, 0x3192);	MAP_CH(0x4E8C, 0x3193);	// 一, 二
+		MAP_CH(0x4E09, 0x3194);	MAP_CH(0x56DB, 0x3195);	// 三, 四
+		MAP_CH(0x4E0A, 0x3196);	MAP_CH(0x4E2D, 0x3197);	// 上, 中
+		MAP_CH(0x4E0B, 0x3198);	MAP_CH(0x7532, 0x3199);	// 下, 甲
+		MAP_CH(0x4E59, 0x319A);	MAP_CH(0x4E19, 0x319B);	// 乙, 丙
+		MAP_CH(0x4E01, 0x319B);	MAP_CH(0x5929, 0x319D);	// 丁, 天
+		MAP_CH(0x5730, 0x319E);	MAP_CH(0x4EBA, 0x319F);	// 地, 人
+		}
+	} else if(ncv == NCV_SUBSCRIPT) {
+		switch(ch) {
+			/* subscripts */
+		MAP_CH(0x0069, 0x1D62);	MAP_CH(0x0072, 0x1D63);	// i, r
+		MAP_CH(0x0075, 0x1D64);	MAP_CH(0x0076, 0x1D65);	// u, v
+		MAP_CH(0x03B2, 0x1D66);	MAP_CH(0x03B3, 0x1D67);	// beta, gamma
+		MAP_CH(0x03C1, 0x1D68);	MAP_CH(0x03C6, 0x1D69);	// rho, phi
+		MAP_CH(0x03C7, 0x1D6A);	// chi
+		MAP_CH(0x0030, 0x2080);	MAP_CH(0x0031, 0x2081);	// 0, 1
+		MAP_CH(0x0032, 0x2082);	MAP_CH(0x0033, 0x2083);	// 2, 3
+		MAP_CH(0x0034, 0x2084);	MAP_CH(0x0035, 0x2085);	// 4, 5
+		MAP_CH(0x0036, 0x2086);	MAP_CH(0x0037, 0x2087);	// 6, 7
+		MAP_CH(0x0038, 0x2088);	MAP_CH(0x0039, 0x2089);	// 8, 9
+		MAP_CH(0x002B, 0x208A);	MAP_CH(0x2212, 0x208B);	// +, -
+		MAP_CH(0x003D, 0x208C);	// =
+		MAP_CH(0x0028, 0x208D);	MAP_CH(0x0029, 0x208E);	// (, )
+		}
+	} else
+		assert(false);
+	return ch;
+#undef MAP_CH
+}
+
+/**
+ *	ウィンドウの作成
+ *	@param parent	親ウィンドウ
+ *	@param rect		作成するウィンドウの矩形
+ *	@param style	ウィンドウスタイル
+ *	@param exStyle	拡張ウィンドウスタイル
+ *	@return			ウィンドウ作成成功時 true
+ */
+bool EditView::create(HWND parent, const RECT& rect, DWORD style, DWORD exStyle) {
+	assertValid();
+	if(isWindow())
+		return false;
+
+	const bool visible = toBoolean(style & WS_VISIBLE);
+
+	style &= ~WS_VISIBLE;
+	if(!Manah::Windows::Controls::CustomControl<EditView>::create(parent, rect, 0, style, exStyle))
+		return false;
+	initializeWindow(originalView_ != this);
+
+	// 位置決めと表示
+	moveWindow(rect, false);
+	if(originalView_ != this) {
+		onHScroll(SB_SETPOS, mapInternalXToScrollBoxX(originalView_->scrollInfo_.position.x), 0);
+		onVScroll(SB_SETPOS, originalView_->scrollInfo_.position.y, 0);
+	}
+	if(visible)
+		showWindow(SW_SHOW);
+
+	return true;
+}
+
+/// @see Window::dispatchEvent
+LRESULT EditView::dispatchEvent(UINT message, WPARAM wParam, LPARAM lParam) {
+#ifndef WM_THEMECHANGED
+	static const UINT WM_THEMECHANGED = 0x031A;
+#endif /* !WM_THEMECHANGED */
+#ifndef WM_UNICHAR
+	static const UINT WM_UNICHAR = 0x0109;
+#endif /* !WM_UNICHAR */
+
+	using namespace Ascension::StandardCommands;
+
+	switch(message) {
+	case WM_CAPTURECHANGED:
+		onCaptureChanged(reinterpret_cast<HWND>(lParam));
+		break;
+	case WM_CHAR:
+		onChar(static_cast<UINT>(wParam), static_cast<UINT>(lParam));
+		return 0L;
+	case WM_CLEAR:
+		if(toBoolean(::GetKeyState(VK_SHIFT) & 0x8000))
+			ClipboardCommand(*this, ClipboardCommand::CUT, true).execute();
+		else
+			DeletionCommand(*this, DeletionCommand::NEXT_CHARACTER).execute();
+		return 0L;
+	case WM_COPY:
+		ClipboardCommand(*this, ClipboardCommand::COPY, true).execute();
+		return 0L;
+	case WM_CUT:
+		ClipboardCommand(*this, ClipboardCommand::CUT, true).execute();
+		return 0L;
+	case WM_ERASEBKGND:
+//		invalidateRect(0, false);
+		return true;
+	case WM_GETFONT:
+		return reinterpret_cast<LRESULT>(sharedData_->layoutManager.getRegularFont());
+#ifndef ASCENSION_NO_ACTIVE_ACCESSIBILITY
+	case WM_GETOBJECT:
+		if(lParam == OBJID_CLIENT) {
+			ComPtr<IAccessible> acc;
+			if(SUCCEEDED(getAccessibleObject(*&acc)) && accLib.isAvailable())
+				return accLib.lresultFromObject(IID_IAccessible, wParam, acc);
+		} else if(lParam == OBJID_WINDOW) {
+		}
+		return 0;
+#endif /* !ASCENSION_NO_ACTIVE_ACCESSIBILITY */
+	case WM_GETTEXT: {
+		ostringstream_t ss;
+		getDocument().getAllLines(ss, LBRP_CRLF);
+		return reinterpret_cast<LRESULT>(ss.str().c_str());
+	}
+	case WM_GETTEXTLENGTH:
+		// ウィンドウ関係だし改行は CRLF でいいか。LBRP_PHYSICAL_DATA だと遅いし
+		return getDocument().getDocumentLength<LBRP_CRLF>();
+	case WM_HSCROLL:
+		onHScroll(LOWORD(wParam), HIWORD(wParam), reinterpret_cast<HWND>(lParam));
+		return 0L;
+	case WM_IME_COMPOSITION:
+		if(onIMEComposition(wParam, lParam))
+			return false;
+		break;
+	case WM_IME_ENDCOMPOSITION:
+		onIMEEndComposition();
+		break;
+	case WM_IME_NOTIFY:
+		if(wParam == IMN_SETOPENSTATUS)
+			recreateCaret();
+		break;
+	case WM_IME_REQUEST:
+		return onIMERequest(wParam, lParam);
+	case WM_IME_STARTCOMPOSITION:
+		onIMEStartComposition();
+		break;
+	case WM_INPUTLANGCHANGE:
+		if(hasFocus())
+			recreateCaret();
+		break;
+	case WM_KEYDOWN:
+		endAutoScroll();
+		if(onKeyDown(static_cast<UINT>(wParam), static_cast<UINT>(lParam)))
+			return false;
+		break;
+	case WM_MBUTTONDOWN:
+		if(mouseOperationDisabledCount_ == 0) {
+			if(modeState_.cursorHiddenForCharInput) {	
+				modeState_.cursorHiddenForCharInput = false;
+				::ShowCursor(true);
+				releaseCapture();
+			}
+			endAutoScroll();
+			setFocus();
+			beginAutoScroll();
+		}
+		return 0L;
+	case WM_MOUSEWHEEL: {
+		POINT pt = {LOWORD(lParam), LOWORD(lParam)};
+		onMouseWheel(LOWORD(wParam), HIWORD(wParam), pt);
+		return 0L;
+	}
+	case WM_PASTE:
+		ClipboardCommand(*this, ClipboardCommand::PASTE, false).execute();
+		return 0L;
+	case WM_RBUTTONDOWN: {
+		POINT pt = {LOWORD(lParam), LOWORD(lParam)};
+		onRButtonDown(static_cast<UINT>(wParam), pt);
+		return 0L;
+	}
+	case WM_SETTEXT:
+		SelectionCreationCommand(*this, SelectionCreationCommand::ALL).execute();
+		getSelection().replace(string_t(reinterpret_cast<const wchar_t*>(lParam)), false);
+		return 0L;
+	case WM_SYSCHAR:
+		if(onSysChar(static_cast<UINT>(wParam), static_cast<UINT>(lParam)))
+			return true;
+		break;
+	case WM_SYSCOLORCHANGE:
+	case WM_THEMECHANGED:
+		onSysColorChange();
+		return 0L;
+	case WM_SYSKEYDOWN:
+		if(onSysKeyDown(static_cast<UINT>(wParam), static_cast<UINT>(lParam)))
+			return true;
+		break;
+	case WM_SYSKEYUP:
+		if(onSysKeyUp(static_cast<UINT>(wParam), static_cast<UINT>(lParam)))
+			return true;
+		break;
+	case WM_UNDO:
+		UndoCommand(*this, true).execute();
+		return 0L;
+	case WM_UNICHAR:
+		onUniChar(static_cast<UINT>(wParam), static_cast<UINT>(lParam));
+		return 0L;
+	case WM_VSCROLL:
+		onVScroll(LOWORD(wParam), HIWORD(wParam), reinterpret_cast<HWND>(lParam));
+		return 0L;
+	}
+
+	return BaseControl::dispatchEvent(message, wParam, lParam);
+}
+
+/**
+ *	論理位置を表示位置に変換する。折り返しをしない場合はそのままの値を返す
+ *	@param logicalPosition	変換する論理位置
+ *	@return					変換された表示位置 (特定できなかったメンバは-1)
+ */
+CharPos EditView::displayCharFromLogicalChar(const CharPos& logicalPosition) const {
+	assertValid();
+
+//	if(modeState_.wrapMode == WPM_NONE)
+		return logicalPosition;
+/*
+	CharPos			posDisplay(0, 0);
+	CLineLayoutInfo*	pInfo = m_pLineLayoutManager->GetLine(0);
+
+	assert(pInfo != 0);
+
+	// 表示行の先頭行まで移動
+	for(length_t iTotalLogicalLine = 0;
+			iTotalLogicalLine < posLogical.iLine; ++iTotalLogicalLine, pInfo = pInfo->m_pNext) {
+		if(pInfo == 0)
+			return CharPos::INVALID_POSITION;
+		posDisplay.iLine += pInfo->GetWrappedPoints().size() + 1;
+	}
+
+	// 文字の確定
+	vector<length_t>::size_type	cOffsets = pInfo->m_vecWrappedOffsets.size();
+
+	// この行には折り返しは無い or 先頭行
+	if(cOffsets == 0 || posLogical.iChar < pInfo->m_vecWrappedOffsets[0]) {
+		posDisplay.iChar = posLogical.iChar;
+		return posDisplay;
+	}
+	
+	for(vector<length_t>::size_type iOffset = cOffsets - 1; iOffset < cOffsets; ++iOffset) {
+		if(pInfo->m_vecWrappedOffsets[iOffset] <= posLogical.iChar) {
+			posDisplay.iChar = posLogical.iChar - pInfo->m_vecWrappedOffsets[iOffset];
+			posDisplay.iLine += iOffset;
+			return posDisplay;
+		}
+	}
+
+	return CharPos::INVALID_POSITION;*/
+}
+
+/**
+ *	論理行を表示行に変換する。折り返しをしない場合はそのままの値を返す
+ *	@param line	変換する論理行
+ *	@return		変換された表示行 (変換に失敗した場合は-1)
+ */
+length_t EditView::displayLineFromLogicalLine(length_t line) const {
+	assertValid();
+
+	assert(line < getDocument().getLineCount());
+//	if(modeState_.wrapMode == WPM_NONE)
+		return line;
+/*
+	length_t			iDisplay = 0;
+	CLineLayoutInfo*	pInfo = m_pLineLayoutManager->GetLine(0);
+
+	assert(pInfo != 0);
+
+	// 表示行の先頭行まで移動
+	for(length_t iTotalLogicalLine = 0;
+			iTotalLogicalLine < iLine; ++iTotalLogicalLine, pInfo = pInfo->m_pNext) {
+		if(pInfo == 0)
+			return -1;
+		iDisplay += pInfo->m_vecWrappedOffsets.size() + 1;
+	}
+	return iDisplay;*/
+}
+
+/// unfreeze の本処理
+void EditView::doUnfreeze() {
+	assertValidAsWindow();
+
+	updateScrollInfo(freezeInfo_.needUpdateScrollInfo.x, freezeInfo_.needUpdateScrollInfo.y);
+	freezeInfo_.needUpdateScrollInfo.x = freezeInfo_.needUpdateScrollInfo.y = false;
+	if(freezeInfo_.scrollPosition.x != -1)
+		onHScroll(SB_SETPOS, mapInternalXToScrollBoxX(freezeInfo_.scrollPosition.x), 0);
+	if(freezeInfo_.scrollPosition.y != -1)
+		onVScroll(SB_SETPOS, freezeInfo_.scrollPosition.y, 0);
+	freezeInfo_.scrollPosition.x = freezeInfo_.scrollPosition.y = -1;
+
+	if(!freezeInfo_.invalidLines.empty()) {
+		length_t anchor = -1;
+		const length_t visibleLineCount = getVisibleLineCount();
+
+//		recalcLeftTabWidth();
+		for(ulong i = scrollInfo_.position.y; i <= scrollInfo_.position.y + visibleLineCount; ++i) {
+			set<length_t>::iterator	it = freezeInfo_.invalidLines.find(i);
+
+			if(it != freezeInfo_.invalidLines.end()) {
+				freezeInfo_.invalidLines.erase(it);
+				if(anchor == -1)
+					anchor = i;
+			} else if(anchor != -1) {
+				invalidateLines(anchor, i - 1);
+				anchor = -1;
+			}
+		}
+		if(anchor != -1)
+			invalidateLines(anchor, scrollInfo_.position.y + visibleLineCount);
+		freezeInfo_.invalidLines.clear();
+	}
+
+	onSelectionChanged(selection_->getRange(), selection_->isRectangle(), false, false);
+	FOR_EACH_LISTENERS()									// 処理の前後で位置が同じだと
+		(*it)->onMoveCaret(selection_->getActivePoint());	// onSelectionChanged 中で通知されないので
+	updateWindow();
+}
+
+/// @see IDropTarget::DragEnter
+STDMETHODIMP EditView::DragEnter(IDataObject* pDataObj, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect) {
+	if(pDataObj == 0)
+		return E_INVALIDARG;
+	VERIFY_POINTER(pdwEffect);
+
+	if(mouseOperationDisabledCount_ != 0) {
+		*pdwEffect = DROPEFFECT_NONE;
+		return S_OK;
+	}
+
+	FORMATETC fe = {CF_TEXT, 0, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+
+	if(leftDownMode_ == LDM_NONE)
+		leftDownMode_ = LDM_DRAGANDDROP;
+	setFocus();
+
+	// ドラッグされてきたデータが有効かどうか調べる
+	if(!getDocument().isReadOnly()
+			&& (leftDownMode_ == LDM_DRAGANDDROPSELF
+			|| pDataObj->QueryGetData(&fe) == S_OK
+			|| (fe.cfFormat = CF_UNICODETEXT, pDataObj->QueryGetData(&fe) == S_OK))) {
+		setTimer(TIMERID_DRAGSCROLL, 50, 0);
+		return DragOver(grfKeyState, pt, pdwEffect);
+	}
+	leftDownMode_ = LDM_NONE;
+	*pdwEffect = DROPEFFECT_NONE;
+	return S_OK;
+}
+
+/// @see IDropTarget::DragLeave
+STDMETHODIMP EditView::DragLeave() {
+	::SetFocus(0);
+	killTimer(TIMERID_DRAGSCROLL);
+	if(leftDownMode_ != LDM_DRAGANDDROPSELF
+			&& leftDownMode_ != LDM_DRAGANDDROPBOXSELF)
+		leftDownMode_ = LDM_NONE;
+	return S_OK;
+}
+
+/// @see IDropTarget::DragOver
+STDMETHODIMP EditView::DragOver(DWORD grfKeyState, POINTL pt, DWORD* pdwEffect) {
+	VERIFY_POINTER(pdwEffect);
+
+	if(mouseOperationDisabledCount_ == 0
+			&& (leftDownMode_ == LDM_DRAGANDDROP
+			|| leftDownMode_ == LDM_DRAGANDDROPSELF
+			|| leftDownMode_ == LDM_DRAGANDDROPBOXSELF)) {	// ドロップ可能な場合以外は何もしない
+		POINT caretPoint = {pt.x, pt.y};
+		screenToClient(caretPoint);
+		setCaretPos(posFromChar(charFromPos(caretPoint,
+			!sharedData_->options.behavior[ACCEPT_CARET_ON_EXTENDER_BY_MOUSE])));
+		if(toBoolean(::GetKeyState(VK_CONTROL) & 0x8000) && toBoolean(::GetKeyState(VK_SHIFT) & 0x8000))
+			*pdwEffect = DROPEFFECT_NONE;
+		else if(leftDownMode_ != LDM_DRAGANDDROP)
+			*pdwEffect = toBoolean(::GetKeyState(VK_CONTROL) & 0x8000) ? DROPEFFECT_COPY : DROPEFFECT_MOVE;
+		else
+			*pdwEffect = DROPEFFECT_COPY;
+	} else
+		*pdwEffect = DROPEFFECT_NONE;
+	return S_OK;
+}
+
+/**
+ *	テキストの下線或いは枠線を描画する (座標は全てビュー座標)
+ *	@paran dc						デバイスコンテキスト
+ *	@param left, top, right, bottom	文字列の矩形
+ *	@param type						下線/枠線の種類
+ *	@param color					下線/枠線の色
+ *	@see							BorderType
+ */
+void EditView::drawBorder(PaintDC& dc, int left, int top, int right, int bottom, BorderType type, COLORREF color) {
+	const LayoutSettings&	layout = getLayoutSetter().getSettings();
+	const RECT&				rect = dc.getPaintStruct().rcPaint;
+
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+#define dc memDC_
+	bottom -= top;
+	top = 0;
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+
+	if(type == BT_NONE)
+		return;
+
+	const long xLeft = max<long>(left, rect.left);
+	const long xRight = min<long>(right, rect.right);
+
+	if(xLeft >= xRight)
+		return;
+
+	HPEN pen, oldPen;
+
+	if(type != BT_UNDERLINE_WAVED) {
+		LOGBRUSH brush;
+		if(type == BT_UNDERLINE_SOLID || type == BT_UNDERLINE_BOLD || type == BT_BORDER_SOLID)
+			pen = ::CreatePen(PS_SOLID, 1, color);
+		else if(type == BT_UNDERLINE_DASHED || type == BT_UNDERLINE_BOLDDASHED || type == BT_BORDER_DASHED) {
+			brush.lbColor = color;
+			brush.lbStyle = BS_SOLID;
+			pen = ::ExtCreatePen(PS_GEOMETRIC | PS_DASH,
+				(type != BT_UNDERLINE_BOLDDASHED) ? 1 : 2, &brush, 0, 0);
+		} else if(type == BT_UNDERLINE_DOTTED || type == BT_UNDERLINE_BOLDDOTTED || type == BT_BORDER_DOTTED) {
+			brush.lbColor = color;
+			brush.lbStyle = BS_SOLID;
+			pen = ::ExtCreatePen(PS_GEOMETRIC | PS_DOT, (type != BT_UNDERLINE_BOLDDOTTED) ? 1 : 2, &brush, 0, 0);
+		} else
+			assert(false);
+		oldPen = dc.selectObject(pen);
+		if(type < BT_UNDERLINE_WAVED) {	// 下線
+			dc.moveTo(xLeft, bottom - 1);
+			dc.lineTo(xRight, bottom - 1);
+		} else {	// 枠線
+			dc.moveTo(xLeft, top), dc.lineTo(xRight, top);
+			dc.moveTo(xLeft, bottom - 1), dc.lineTo(xRight, bottom - 1);
+			if(left == xLeft)
+				dc.moveTo(xLeft, top), dc.lineTo(xLeft, bottom);
+			if(right == xRight)
+				dc.moveTo(xRight - 1, top), dc.lineTo(xRight - 1, bottom);
+		}
+		dc.selectObject(oldPen);
+	} else {	// 波線の下線
+		pen = ::CreatePen(PS_SOLID, 1, color);
+		oldPen = dc.selectObject(pen);
+		for(int i = 0; left + i * 2 <= xRight; ++i) {
+			dc.moveTo(left + i * 2, bottom - ((i % 2 == 0) ? 1 : 2));
+			dc.lineTo(left + i * 2 + 2, bottom - ((i % 2 == 0) ? 1 : 2));
+		}
+		dc.selectObject(oldPen);
+	}
+	::DeleteObject(pen);
+
+#undef dc
+}
+
+/**
+ *	バッファ終端マーカの描画
+ *	@param dc	デバイスコンテキスト。属性は全て適切なものに設定されている。変更した場合は元に戻さなければならない
+ *	@param x, y	位置
+ *	@return		描画幅
+ */
+int EditView::drawEOFMarker(PaintDC& dc, int x, int y) {
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+#define dc memDC_
+	y = 0;
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+
+	const string_t& marker = getLayoutSetter().getSettings().substitutionGlyphs.endOfFile;
+	RECT rect;
+
+	rect.top = y;
+	rect.bottom = y + sharedData_->layoutManager.getLineHeight();
+
+	if(!getLayoutSetter().getSettings().rightToLeftReading) {
+		rect.left = x;
+		rect.right = x + dc.getTextExtent(marker.data(), static_cast<int>(marker.length())).cx;
+		dc.extTextOut(rect.left, rect.top, ETO_OPAQUE, &rect, marker.data(), static_cast<int>(marker.length()), 0);
+	} else {
+		rect.right = x;
+		rect.left = x - dc.getTextExtent(marker.data(), static_cast<int>(marker.length())).cx;
+		dc.extTextOut(rect.left, rect.top, ETO_OPAQUE | ETO_RTLREADING, &rect, marker.data(), static_cast<int>(marker.length()), 0);
+	}
+	return rect.right - rect.left;
+
+#undef dc
+}
+
+/**
+ *	垂直ルーラのインジケータマージン描画後に呼び出される
+ *	@param line	論理行
+ *	@param dc	デバイスコンテキスト
+ *	@param rect	描画範囲
+ */
+void EditView::drawIndicatorMargin(length_t line, DC& dc, const RECT& rect) {
+}
+
+/**
+ *	論理行1行を描画する
+ *	@param dc			デバイスコンテキスト
+ *	@param line			描画する論理行
+ *	@param y			クライアント y 座標
+ *	@param caretLine	現在行か
+ *	@return				描画した表示行数
+ */
+length_t EditView::drawLine(PaintDC& dc, length_t line, int y, bool caretLine) {
+	assertValidAsWindow();
+
+#ifdef _DEBUG
+	if(DIAGNOSE_INHERENT_DRAWING)
+		dout << line << ",";
+#endif /* _DEBUG */
+
+#define MAP_TO_DRAWING_POS(x__)	mapAbsoluteXToClientX(x__, lineLayout.getWidth())
+#define GET_ETO_FLAGS()			ETO_OPAQUE | (currentRun.isRightToLeft() ? ETO_RTLREADING : 0)
+#define IS_DIRECTIONAL_FORMATTING_CODE(cp__)	\
+	(cp__ == 0x200E || cp__ == 0x200F || (cp__ >= 0x202A && cp__ <= 0x202E))
+
+//	Timer tm(L"DrawLine");
+
+	const LineLayoutManager& layoutManager = sharedData_->layoutManager;
+	const LayoutSettings& layout = getLayoutSetter().getSettings();
+	const LineLayout& lineLayout = layoutManager.getLine(line);
+	const EditDoc::Line& thisLine = getDocument().getLineInfo(line);
+	const char_t* const first = thisLine.getLine().data();
+	const char_t* const last = first + thisLine.getLine().length();
+	const RECT& paintRect = dc.getPaintStruct().rcPaint;
+
+	// メモリデバイスコンテキストを使う場合は出力先を変更
+	PaintDC& originalDC = dc;
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+#define dc memDC_
+	const int yOriginal = y;
+	y = 0;
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+
+	const EmphaticTextType selectionEmType = hasFocus() ? ETT_SELECTION : ETT_INACTIVE_SELECTION;
+
+	typedef pair<const char_t*, const char_t*> Range;
+
+	long xOffset;					// 描画位置 (クライアント x 座標)
+	length_t drawnLineCount = 0;	// 戻り値
+	COLORREF entireFgColor = -1;	// onQueryLineColor から得た統一前景色
+	COLORREF entireBgColor = -1;	// onQueryLineColor から得た統一背景色
+	const COLORREF selFgColor = layoutManager.getTokenFoundation(selectionEmType, Token::NULL_COOKIE).fgColor;
+	const COLORREF selBgColor = layoutManager.getTokenFoundation(selectionEmType, Token::NULL_COOKIE).bgColor;
+	const COLORREF restrictionFgColor = layoutManager.getTokenFoundation(ETT_RESTRICTION, Token::NULL_COOKIE).fgColor;
+	const COLORREF restrictionBgColor = layoutManager.getTokenFoundation(ETT_RESTRICTION, Token::NULL_COOKIE).bgColor;
+	list<Range>	links;		// リンク部分のリスト
+//	list<Range>	matches;	// 現在の検索条件に一致する部分のリスト
+
+	// この行における選択範囲とアクセス可能範囲 (ナローイングされてない部分)。
+	// 範囲が次の行に及んでいる場合は second は last + 1 を指す
+	Range sel, acc;
+
+	// 選択範囲の計算
+	{
+		length_t i, j;
+		selection_->getRangeOnLine(line, &i, &j);
+		sel.first = (i != static_cast<length_t>(-1)) ? first + i : last + 1;
+		sel.second = (j != static_cast<length_t>(-1)) ? first + j : last + 1;
+		if(sel.first > sel.second)
+			swap(sel.first, sel.second);
+	}
+
+	// アクセス可能範囲の計算
+	if(!getDocument().isNarrowed()) {
+		acc.first = first;
+		acc.second = last + 1;
+	} else {
+		const CharPos start = getDocument().getStartPoint();
+		const CharPos end = getDocument().getEndPoint();
+		if(line < start.line_)
+			acc.first = acc.second = last + 1;
+		else if(line > end.line_)
+			acc.first = acc.second = first;
+		else {
+			acc.first = (line > start.line_) ? first : first + start.char_;
+			acc.second = (line < end.line_) ? last + 1 : first + end.char_;
+		}
+	}
+
+	// リンクの検出
+	if(layoutManager.isTokenEnabled(ETT_LINK)
+			&& layoutManager.getTokenFoundation(ETT_LINK, Token::NULL_COOKIE).border != BT_NONE) {
+		const char_t* linkEnd;
+		for(const char_t* p = first; p < last; ++p) {
+
+			if((p != (linkEnd = URIDetector::eatURL(p, last, true)))
+					|| (p != (linkEnd = URIDetector::eatMailAddress(p, last, true)))) {
+				links.push_back(make_pair(p, linkEnd));
+				p = linkEnd;
+			}
+		}
+	}
+
+	// 検索一致部分の計算
+	if(sharedData_->highlightMatches
+			&& sharedData_->options.appearance[HIGHLIGHT_MATCH_TEXT]
+			&& layoutManager.isTokenEnabled(ETT_MATCHTEXT)) {
+		// TODO: 未実装
+	}
+
+	// 前処理
+	dc.setTextCharacterExtra(layout.charSpan);
+	dc.setBkMode(TRANSPARENT);	// ClearType でフォントの縁を滑らかにしている場合はこれが無いと駄目
+	xOffset = MAP_TO_DRAWING_POS(0);
+	queryLineColors(line, entireFgColor, entireBgColor);
+
+	// 以下、テキストの描画。
+	// 一気に描くことができないので何らかの境界で複数回に分けて描画する。
+	// その境界となるのは次の通り:
+	// - 方向の変わり目 (ラン境界)
+	// - トークン境界
+	// - 選択境界
+	// - ナローイングの外側と内側の境界
+	// - 代替グリフを使う水平タブ、空白類文字、ASCII 制御文字 (これらは1文字ずつ描画する)
+
+	// ランごとのループ
+	const LineLayout::Runs& runs = lineLayout.getRuns();
+	const Tokens& tokens = lineLayout.getTokens();
+	const char_t* p;				// 文字位置
+	RECT rect = {0, y, 0, y + layoutManager.getLineHeight()};
+	queue<const char_t*> bidiFormatterOccurences;
+
+	if(tokens.count == 0 || last - first == 0)	// トークンが無けりゃ無視
+		goto TEXT_END;
+	for(size_t runIndex = 0, tokenIndex = 0; runIndex < runs.getCount(); ++runIndex) {
+		const LineLayout::Run& currentRun = runs.getAt(runIndex);	// 描画中のラン
+		const bool lastRun = runIndex == runs.getCount() - 1;		// 最後のランか?
+		const int runWidth = (currentRun.getWidth() != LineLayout::Run::LINE_WIDTH) ? currentRun.getWidth() : lineLayout.getWidth();
+		const char_t* const nextRun = !lastRun ? first + runs.getAt(runIndex + 1).getIndex() : last;	// 次のランの開始位置
+		int	nextDrawStart =	// 次回描画開始位置。paintRect との比較に使用
+			MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(currentRun.getIndex()));
+
+		// 描画が必要かチェック
+		if(!currentRun.isRightToLeft() && (nextDrawStart >= paintRect.right || nextDrawStart + runWidth < paintRect.left))
+			continue;
+		else if(currentRun.isRightToLeft() && (nextDrawStart - runWidth >= paintRect.right || nextDrawStart < paintRect.left))
+			continue;
+
+		p = first + currentRun.getIndex();
+
+		// 描画するランを含む最初のトークンまで移動
+		while(tokenIndex < tokens.count && first + tokens.array[tokenIndex].getIndex() <= p)
+			++tokenIndex;
+		--tokenIndex;
+
+		// トークンごとのループ (ラン境界はトークン境界と同じ位置に現れるとは限らないんで注意)
+		while(tokenIndex < tokens.count) {
+			const Token& currentToken = tokens.array[tokenIndex];
+			const char_t* const nextToken = (tokenIndex != tokens.count - 1) ?
+							first + tokens.array[tokenIndex + 1].getIndex() : last;
+			const int tokenType = (nextToken - p == 1
+				&& layoutManager.isTokenEnabled(ETT_MATCH_BRACKETS)
+				&& ((line == hilightedBracketPositions_[0].line_ && p - first == hilightedBracketPositions_[0].char_)
+				|| (line == hilightedBracketPositions_[1].line_ && p - first == hilightedBracketPositions_[1].char_))) ?
+				ETT_MATCH_BRACKETS : currentToken.getType();
+			const TextFoundation foundation = layoutManager.getTokenFoundation(tokenType, currentToken.getCookie());
+			HFONT oldFont = dc.selectObject(layoutManager.getFontForRenderingToken(tokenType, currentToken.getCookie()));
+			const int tokenEdge = nextDrawStart;
+
+			do {
+				enum {NORMAL, SELECTION, RESTRICTION} regionalOverlay = NORMAL;
+				if(p >= sel.first && p < sel.second)
+					regionalOverlay = SELECTION;
+				else if(getDocument().isNarrowed() && (p < acc.first || p >= acc.second))
+					regionalOverlay = RESTRICTION;
+
+#define SELECT_FG_COLOR(selectionColor, restrictionColor, normalColor)			\
+	if(regionalOverlay == SELECTION && selectionColor != 0x80000000)			\
+		dc.setTextColor(selectionColor);										\
+	else if(regionalOverlay == RESTRICTION && restrictionColor != 0x80000000)	\
+		dc.setTextColor(restrictionColor);										\
+	else																		\
+		dc.setTextColor((entireFgColor == -1) ? normalColor : entireFgColor)
+#define SELECT_BG_COLOR(selectionColor, restrictionColor, normalColor)			\
+	if(regionalOverlay == SELECTION && selectionColor != 0x80000000)			\
+		dc.setBkColor(selectionColor);											\
+	else if(entireBgColor != -1)												\
+		dc.setBkColor(entireBgColor);											\
+	else if(regionalOverlay == RESTRICTION && restrictionColor != 0x80000000)	\
+		dc.setBkColor(restrictionColor);										\
+	else																		\
+		dc.setBkColor(normalColor)
+
+				// 水平タブ
+				if(*p == L'\t') {
+					// 描画領域の計算
+					if(!currentRun.isRightToLeft()) {	// LTR
+						rect.left = MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first));
+						nextDrawStart = rect.right = MAP_TO_DRAWING_POS(
+							layoutManager.getNextTabStop(mapClientXToAbsoluteX(rect.left, lineLayout.getWidth()), true));
+					} else {	// RTL
+						rect.right = MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first));
+						nextDrawStart = rect.left = MAP_TO_DRAWING_POS(
+							layoutManager.getNextTabStop(mapClientXToAbsoluteX(rect.left, lineLayout.getWidth()), false));
+					}
+
+					if(rect.right >= paintRect.left && rect.left <= paintRect.right) {
+						SELECT_FG_COLOR(selFgColor, restrictionFgColor,
+							layoutManager.getTokenFoundation(Token::TAB, Token::NULL_COOKIE).fgColor);
+						SELECT_BG_COLOR(selBgColor, restrictionBgColor,
+							layoutManager.getTokenFoundation(tokenType, currentToken.getCookie()).bgColor);
+						dc.extTextOut(rect.left, y, GET_ETO_FLAGS(),
+							&rect, &layout.substitutionGlyphs.horizontalTab,
+							(regionalOverlay == SELECTION || !sharedData_->options.appearance[SHOW_WHITESPACE_ALTERNATIVE]) ? 0 : 1, 0);
+					}
+					++p;
+				}
+
+				// ASCII 制御文字
+				else if(Lexer::isASCIIControl(*p)) {
+					char_t substitution[2];
+					Lexer::getAsciiControlSubstitutionGlyph(static_cast<uchar>(*p), substitution);
+
+					if(currentRun.isRightToLeft())	// 自分で逆さまにしちゃえ
+						swap(substitution[0], substitution[1]);
+
+					// 描画領域の計算
+					(!currentRun.isRightToLeft() ? rect.left : rect.right) = MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first));
+					if(!currentRun.isRightToLeft())	// LTR
+						nextDrawStart = rect.right = (nextRun - p > 1) ?
+							MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first + 1))
+							: rect.left + dc.getTextExtent(substitution, 2).cx;
+					else	// RTL
+						nextDrawStart = rect.left = (nextRun - p > 1) ?
+							MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first + 1))
+							: rect.right - dc.getTextExtent(substitution, 2).cx;
+
+					if(rect.right >= paintRect.left && rect.left <= paintRect.right) {
+						SELECT_FG_COLOR(0x80000000, restrictionFgColor,
+							layoutManager.getTokenFoundation(Token::ASCII_CONTROL, Token::NULL_COOKIE).fgColor);
+						SELECT_BG_COLOR(selBgColor, restrictionBgColor,
+							layoutManager.getTokenFoundation(tokenType, currentToken.getCookie()).bgColor);
+						dc.extTextOut(rect.left, y, ETO_OPAQUE, &rect, substitution, 2, 0);
+					}
+					++p;
+				}
+
+				// 空白類文字
+				else if(getLexer().isWhiteSpace(*p, false)) {
+					// 代替グリフと前景色を決める
+					char_t substitution;
+					if(!sharedData_->options.appearance[SHOW_WHITESPACE_ALTERNATIVE])
+						substitution = L' ';
+					else if(*p == L'\x1680') {	// Ogham Space Mark
+						substitution = L'\x1680';
+						SELECT_FG_COLOR(0x80000000, restrictionFgColor,
+							layoutManager.getTokenFoundation(Token::WHITESPACE, Token::NULL_COOKIE).fgColor);
+					} else {
+						if(*p == L'\x3000')	// Ideographic Space
+							substitution = layout.substitutionGlyphs.ideographicSpace;
+						else
+							substitution = layout.substitutionGlyphs.generalWhiteSpace;
+						SELECT_FG_COLOR(0x80000000, restrictionFgColor,
+							layoutManager.getTokenFoundation(Token::WHITESPACE, Token::WHITESPACE).fgColor);
+					}
+
+					// 描画領域の計算
+					(!currentRun.isRightToLeft() ? rect.left : rect.right) = MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first));
+					if(!currentRun.isRightToLeft())	// LTR
+						nextDrawStart = rect.right = (nextRun - p > 1) ?
+							MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first + 1)) : rect.left + dc.getTextExtent(p, 1).cx;
+					else	// RTL
+						nextDrawStart = rect.left = (nextRun - p > 1) ?
+							MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first + 1)) : rect.right - dc.getTextExtent(p, 1).cx;
+					if(rect.right >= paintRect.left && rect.left <= paintRect.right) {
+						SELECT_BG_COLOR(selBgColor, restrictionBgColor,
+							layoutManager.getTokenFoundation(tokenType, currentToken.getCookie()).bgColor);
+						dc.extTextOut(rect.left, y, GET_ETO_FLAGS(), &rect, &substitution,
+							(regionalOverlay == SELECTION || !sharedData_->options.appearance[SHOW_WHITESPACE_ALTERNATIVE]) ? 0 : 1, 0);
+					}
+					++p;
+				}
+
+				// Unicode 方向制御コードは後でまとめて描画
+				else if(IS_DIRECTIONAL_FORMATTING_CODE(*p)) {
+					if(sharedData_->options.appearance[SHOW_UNICODE_CONTROLS])
+						bidiFormatterOccurences.push(p);
+					++p;
+				}
+
+				// それ以外は何らかの境界に達するまでまとめて描画する
+				else {
+					// 描画する文字数を決める
+					length_t drawLength = 1;
+					const char_t* const nextRunOrTokenBoundary = min(nextRun, nextToken);
+					while(p + drawLength < nextRunOrTokenBoundary) {
+						if(getLexer().isWhiteSpace(p[drawLength], true)
+								|| Lexer::isASCIIControl(p[drawLength])
+								|| p + drawLength == sel.first
+								|| p + drawLength == sel.second
+								|| (getDocument().isNarrowed() && (p + drawLength == acc.first || p + drawLength == acc.second))
+								|| IS_DIRECTIONAL_FORMATTING_CODE(p[drawLength]))
+							break;
+						++drawLength;
+					}
+
+					// 描画領域の計算
+					if(!currentRun.isRightToLeft()) {	// LTR
+						rect.left = MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first));
+						nextDrawStart = rect.right =
+							(runs.getCount() == 1 || nextRun > p + drawLength) ?
+								MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first + drawLength))
+								: rect.left + dc.getTextExtent(p, static_cast<int>(drawLength)).cx;
+					} else {	// RTL
+						rect.right = MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first));
+						nextDrawStart = rect.left =
+							(runs.getCount() == 1 || nextRun > p + drawLength) ?
+								MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(p - first + drawLength))
+								: rect.right - dc.getTextExtent(p, static_cast<int>(drawLength)).cx;
+					}
+
+					if(rect.right >= paintRect.left && rect.left <= paintRect.right) {
+						SELECT_FG_COLOR(selFgColor, restrictionFgColor, foundation.fgColor);
+						SELECT_BG_COLOR(selBgColor, restrictionBgColor, foundation.bgColor);
+						if(currentRun.isRightToLeft() && p > first) {
+							// 無理やり RTL にする...
+							const char_t temp = p[-1];
+							const_cast<char_t*>(p)[-1] = 0x202E;	// RLO
+							dc.extTextOut(rect.left, y, GET_ETO_FLAGS(), &rect, p - 1, static_cast<int>(drawLength + 1), 0);
+							const_cast<char_t*>(p)[-1] = temp;
+						} else
+							dc.extTextOut(rect.left, y, GET_ETO_FLAGS(), &rect, p, static_cast<int>(drawLength), 0);
+					}
+					p += drawLength;
+				}
+
+				if((!currentRun.isRightToLeft() && nextDrawStart > paintRect.right)
+						|| (currentRun.isRightToLeft() && nextDrawStart < paintRect.left))
+					p = nextRun;	// これ以上このランを描くのは無駄
+			} while(p < nextToken && p < nextRun);
+
+			if(p == nextToken) {	// トークン終端に達した
+				++tokenIndex;
+				dc.selectObject(oldFont);
+				if(foundation.border != BT_NONE)	// 下線/枠線を引く
+					drawBorder(originalDC, min(tokenEdge, nextDrawStart), rect.top,
+						max(tokenEdge, nextDrawStart), rect.bottom - layout.lineSpan,
+						foundation.border, foundation.borderColor);
+			}
+
+			if(p == nextRun)	// ラン終端に達した
+				break;
+		}
+	}
+
+TEXT_END:
+
+	// リンクの強調表示
+	if(!links.empty()) {
+		const TextFoundation foundation = layoutManager.getTokenFoundation(ETT_LINK, Token::NULL_COOKIE);
+		for(list<pair<const char_t*, const char_t*> >::const_iterator it = links.begin(); it != links.end(); ++it) {
+			drawBorder(originalDC, posFromChar(CharPos(line, it->first - first)).x, y,
+				posFromChar(CharPos(line, it->second - first)).x,
+				y + layoutManager.getLineHeight() - layout.lineSpan, foundation.border, foundation.borderColor);
+		}
+	}
+
+	// 終了マーク (バッファ終端、行終端)
+	int	endMarkWidth = 0;
+	if((!layout.rightToLeftReading && MAP_TO_DRAWING_POS(lineLayout.getWidth()) <= paintRect.right)
+			|| (layout.rightToLeftReading && MAP_TO_DRAWING_POS(lineLayout.getWidth()) >= paintRect.left)) {
+
+		// バッファ終端
+		if(line == getDocument().getLineCount() - 1) {
+			if(!layout.substitutionGlyphs.endOfFile.empty()
+					&& sharedData_->options.appearance[SHOW_END_OF_FILE]) {	// [EOF] マーク
+				const TextFoundation& foundation = layoutManager.getTokenFoundation(ETT_END_OF_FILE, Token::NULL_COOKIE);
+				HFONT oldFont = dc.selectObject(layoutManager.getFontForRenderingToken(ETT_END_OF_FILE, Token::NULL_COOKIE));
+
+				dc.setTextColor(foundation.fgColor);
+				dc.setBkColor(foundation.bgColor);
+				endMarkWidth = drawEOFMarker(originalDC, MAP_TO_DRAWING_POS(lineLayout.getWidth()), y);
+				dc.selectObject(oldFont);
+			}
+		}
+
+		// 行終端
+		else if(sharedData_->options.appearance[SHOW_BREAK_ARROWS]) {
+			COLORREF bgColor;
+
+			if(entireBgColor != -1)
+				bgColor = entireBgColor;
+			else if(sel.first <= last && sel.second == last + 1 && sharedData_->options.appearance[SHOW_SELECTION_ON_BREAK])
+				bgColor = selBgColor;
+			else
+				bgColor = layoutManager.getTokenFoundation(ETT_NORMAL, Token::NULL_COOKIE).bgColor;
+			endMarkWidth = drawLineTerminator(originalDC,
+				MAP_TO_DRAWING_POS(!layout.rightAlign ? lineLayout.getWidth() : 0), y, thisLine.getLineBreak(),
+				acc.first == last + 1 || acc.second <= last, bgColor, layout.rightAlign);
+		}
+	}
+
+	// 後続の余白
+	const int xEnd = MAP_TO_DRAWING_POS(
+		!layout.rightAlign ? lineLayout.getWidth() : 0) + (!layout.rightAlign ? endMarkWidth : -endMarkWidth);
+	if(!layout.rightAlign && xEnd <= paintRect.right)	// 左寄せ
+		dc.fillSolidRect(xEnd, y, paintRect.right - xEnd,
+			layoutManager.getLineHeight(), (entireBgColor == -1) ?
+			layoutManager.getTokenFoundation(ETT_NORMAL, Token::NULL_COOKIE).bgColor : entireBgColor);
+	else if(layout.rightAlign && xEnd >= paintRect.left)	// 右寄せ
+		dc.fillSolidRect(paintRect.left, y, xEnd - paintRect.left,
+			layoutManager.getLineHeight(), (entireBgColor == -1) ?
+			layoutManager.getTokenFoundation(ETT_NORMAL, Token::NULL_COOKIE).bgColor : entireBgColor);
+
+	// Unicode 方向制御コード
+	if(sharedData_->options.appearance[SHOW_UNICODE_CONTROLS] && !bidiFormatterOccurences.empty()) {
+		const LineLayoutManager::BidirectionalFormatterSubstitutionDriver&
+				sub = layoutManager.getFontForBidirectionalFormatterSubstitution();
+		HFONT oldFont = dc.selectObject(sub.getFont());
+
+		while(!bidiFormatterOccurences.empty()) {
+			const char_t* const occurence = bidiFormatterOccurences.front();
+			const ushort glyph = sub.getGlyphIndex(dc, *occurence);
+			if(glyph != 0xFFFF) {
+				const TextFoundation foundation = layoutManager.getTokenFoundation(
+					(occurence >= sel.first && occurence < sel.second) ? ETT_SELECTION :
+					((occurence < acc.first || occurence > acc.second) ? ETT_RESTRICTION :
+					Token::UNICODE_CONTROL), Token::NULL_COOKIE);
+				dc.setTextColor(foundation.fgColor);
+				dc.setBkColor(foundation.bgColor);
+				dc.extTextOut(MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(occurence - first)),
+					y, ETO_GLYPH_INDEX, 0, reinterpret_cast<char_t*>(const_cast<ushort*>(&glyph)), 1, 0);
+//				dc.extTextOut(MAP_TO_DRAWING_POS(lineLayout.getCaretPosition(occurence - first)), y, ETO_IGNORELANGUAGE, 0, occurence, 1, 0);
+			}
+			bidiFormatterOccurences.pop();
+		}
+		dc.selectObject(oldFont);
+	}
+
+	// 現在行の下線
+	if(caretLine) {
+		RECT clientRect;
+		HPEN oldPen = dc.selectObject(hasFocus() ?
+			sharedData_->gdiObjects.caretLinePen : sharedData_->gdiObjects.inactiveCaretLinePen);
+
+		getClientRect(clientRect);
+		dc.moveTo(!layout.rightAlign ?
+			clientRect.left + layoutManager.getVerticalRulerWidth() + layout.leadMargin : clientRect.left,
+			y + layoutManager.getLineHeight() - 1);
+		dc.lineTo(!layout.rightAlign ?
+			clientRect.right : clientRect.right - layoutManager.getVerticalRulerWidth() + layout.leadMargin,
+			y + layoutManager.getLineHeight() - 1);
+		dc.selectObject(oldPen);
+	}
+
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+	// 通常の描画ビットマップに描画内容を転送
+#undef dc
+	RECT clientRect;
+	getClientRect(clientRect);
+	const int left = max(!layout.rightAlign ?
+		clientRect.left + layoutManager.getVerticalRulerWidth() + layout.leadMargin : clientRect.left, clientRect.left);
+	const int right = min(!layout.rightAlign ?
+		clientRect.right : clientRect.right - layoutManager.getVerticalRulerWidth() + layout.leadMargin, clientRect.right);
+	dc.bitBlt(left, yOriginal, right - left, layoutManager.getLineHeight() * 1, memDC_, left, 0, SRCCOPY);
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+
+	return 1;
+
+#undef MAP_TO_DRAWING_POS
+#undef GET_ETO_FLAGS
+#undef IS_DIRECTION_FORMATTER
+#undef SELECT_FG_COLOR
+#undef SELECT_BG_COLOR
+}
+
+/**
+ *	改行マークの描画
+ *	@param dc			デバイスコンテキスト
+ *	@param x, y			描画位置
+ *	@param lineBreak	描画する改行
+ *	@param restricted	ナローイングされた部分か
+ *	@param bgColor		背景色
+ *	@param mirrored		左右反転させるか
+ *	@return				描画幅
+ */
+int EditView::drawLineTerminator(PaintDC& dc,
+		int x, int y, LineBreak lineBreak, bool restricted, COLORREF bgColor, bool mirrored) {
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+#define dc memDC_
+	y = 0;
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+
+	const LineLayoutManager& layoutManager = sharedData_->layoutManager;
+	const LayoutSettings& layout = layoutManager.getSettings();
+
+	if((lineBreak == LB_LF && layout.substitutionGlyphs.unixEOL == 0xFFFF)
+			|| (lineBreak == LB_CR && layout.substitutionGlyphs.macintoshEOL == 0xFFFF)
+			|| (lineBreak == LB_CRLF && layout.substitutionGlyphs.windowsEOL == 0xFFFF)) {
+		HPEN oldPen = dc.selectObject(restricted ?
+					sharedData_->gdiObjects.restrictedLineTerminatorPen : sharedData_->gdiObjects.lineTerminatorPen);
+		int cx = layoutManager.getAverageCharacterWidth();
+		int cy = layoutManager.getLineHeight();
+		int hx, hy;
+
+		// 最小値の設定
+		cx = max(cx, 7);
+
+		// RTL の場合は反転
+		if(getLayoutSetter().getSettings().rightToLeftReading)
+			x -= cx;
+
+		// 背景色を塗る
+		dc.fillSolidRect(x, y, cx, cy, bgColor);
+
+		// 奇数に揃えると描き易い?
+		cx -= (cx % 2 == 0) ? 1 : 0;
+		cy -= (cy % 2 == 0) ? 1 : 0;
+
+		// 半分の位置
+		hx = x + cx / 2;
+		hy = y + cy / 2;
+
+/*
+		以前使っていた右矢印の描画コード
+		dc.moveTo(x + 1, hy);
+		dc.lineTo(x + cx, hy);
+		dc.moveTo(hx + 1, hy - cx / 2 + 1);
+		dc.lineTo(x + cx, hy + 1);
+		dc.moveTo(hx + 1, hy + cx / 2 - 1);
+		dc.lineTo(x + cx, hy - 1);
+*/
+
+		if(lineBreak == LB_LF) {	// 左矢印
+			dc.moveTo(x + cx - 1, hy);
+			dc.lineTo(x, hy);
+			dc.moveTo(hx - 0, hy - cx / 2 + 1);
+			dc.lineTo(x + 0, hy + 1);
+			dc.moveTo(hx - 0, hy + cx / 2 - 1);
+			dc.lineTo(x + 0, hy - 1);
+		} else if(lineBreak == LB_CR) {	// 下矢印
+			dc.moveTo(hx, hy - cx / 2);
+			dc.lineTo(hx, hy + cx / 2 + 1);
+			dc.moveTo(x + 1, hy + 1);
+			dc.lineTo(hx, hy + cx / 2);
+			dc.moveTo(x + cx - 2, hy + 1);
+			dc.lineTo(hx, hy + cx / 2);
+		} else {	// 下左直角矢印
+			dc.moveTo(x + cx - 1, hy - cx / 2);
+			dc.lineTo(x + cx - 1, hy + cy / 4);
+			dc.lineTo(x, hy + cy / 4);
+			dc.moveTo(hx - 0, hy - cx / 2 + 1 + cy / 4);
+			dc.lineTo(x + 0, hy + 1 + cy / 4);
+			dc.moveTo(hx - 0, hy + cx / 2 - 1 + cy / 4);
+			dc.lineTo(x + 0, hy - 1 + cy / 4);
+		}
+		dc.selectObject(oldPen);
+		return cx;
+	} else {	// グリフを使って描画する
+		HFONT oldFont = dc.selectObject(layoutManager.getRegularFont());
+		RECT rect;
+		int width;
+		char_t glyphChar;
+
+		switch(lineBreak) {
+		case LB_LF:		glyphChar = layout.substitutionGlyphs.unixEOL;				break;
+		case LB_CR:		glyphChar = layout.substitutionGlyphs.macintoshEOL;			break;
+		case LB_CRLF:	glyphChar = layout.substitutionGlyphs.windowsEOL;			break;
+		case LB_NEL:	glyphChar = layout.substitutionGlyphs.ebcdicEOL;			break;
+		case LB_LS:		glyphChar = layout.substitutionGlyphs.lineSeparator;		break;
+		case LB_PS:		glyphChar = layout.substitutionGlyphs.paragraphSeparator;	break;
+		default:		assert(false);
+		}
+
+		dc.getCharWidth(glyphChar, glyphChar, &width);
+		::SetRect(&rect, x, y, x + width, y + layoutManager.getLineHeight());
+		dc.setTextColor(layoutManager.getTokenFoundation(
+			restricted ? ETT_RESTRICTION : ETT_END_OF_LINE, Token::NULL_COOKIE).fgColor);
+		dc.setBkColor(bgColor);
+		dc.setBkMode(OPAQUE);
+		dc.extTextOut(x, y, ETO_OPAQUE, &rect, &glyphChar, 1, 0);
+		dc.selectObject(oldFont);
+
+		return width;
+	}
+
+#undef dc
+}
+
+/**
+ *	垂直ルーラを描画
+ *	@param dc					デバイスコンテキスト
+ *	@param startLine, endLine	描画開始行と終了行 (いずれも表示行。これらの行も描画に含まれる)
+ */
+void EditView::drawVerticalRuler(PaintDC& dc, length_t startLine, length_t endLine) {
+	assertValidAsWindow();
+
+#ifdef _DEBUG
+	if(DIAGNOSE_INHERENT_DRAWING)
+		dout << L"ruler lines : " << startLine << L" ... " << endLine << L"\n";
+#endif /* _DEBUG */
+
+	if(startLine > endLine)
+		swap(startLine, endLine);
+
+	const LineLayoutManager& layoutManager = sharedData_->layoutManager;
+	const LayoutSettings& layout = getLayoutSetter().getSettings();
+	const ushort lineHeight = layoutManager.getLineHeight();
+	RECT clientRect;
+	const int yStart = layout.topMargin + static_cast<int>(startLine - scrollInfo_.position.y) * lineHeight;
+
+	getClientRect(clientRect);
+
+	const int yEnd = min<int>(yStart + static_cast<int>(endLine - startLine + 1) * lineHeight, dc.getPaintStruct().rcPaint.bottom);
+	const long bottomSpace = clientRect.bottom - yStart -
+					static_cast<int>(getDocument().getLineCount() - startLine) * lineHeight;
+
+	// インジケータマージン
+	if(layout.lineNumberLayout.showIndicatorMargin) {
+		const ushort width = layout.lineNumberLayout.indicatorMarginWidth;
+		HPEN oldPen = dc.selectObject(sharedData_->gdiObjects.indicatorMarginPen);
+		const COLORREF bgColor = layoutManager.getTokenFoundation(ETT_INDICATOR_MARGIN, Token::NULL_COOKIE).bgColor;
+
+		// 上余白
+		if(layout.topMargin != 0) {
+			dc.fillSolidRect(!layout.rightAlign ?
+				clientRect.left : clientRect.right - width + 1, clientRect.top, width, layout.topMargin, bgColor);
+			dc.moveTo(!layout.rightAlign ? clientRect.left + width - 1 : clientRect.right - width, clientRect.top);
+			dc.lineTo(!layout.rightAlign ?
+				clientRect.left + width - 1 : clientRect.right - width, clientRect.top + layout.topMargin);
+		}
+
+		// 各行に対応する部分
+		if(layout.wrapMode == WPM_NONE) {
+			dc.fillSolidRect(!layout.rightAlign ?
+				clientRect.left : clientRect.right - width + 1, yStart, width, yEnd - yStart, bgColor);
+			dc.moveTo(!layout.rightAlign ? clientRect.left + width - 1 : clientRect.right - width, yStart);
+			dc.lineTo(!layout.rightAlign ? clientRect.left + width - 1 : clientRect.right - width, yEnd);
+
+			// 派生クラスにインジケータマージンの描画機会を与える
+			RECT rect = {!layout.rightAlign ? clientRect.left : clientRect.right - width,
+							yStart, !layout.rightAlign ? clientRect.left + width : clientRect.right, yEnd};
+			for(length_t line = startLine; line <= endLine; ++line) {
+				drawIndicatorMargin(line, dc, rect);
+				::OffsetRect(&rect, 0, lineHeight);
+			}
+		}
+
+		// 下余白
+		if(bottomSpace > 0) {
+			dc.fillSolidRect(!layout.rightAlign ?
+				clientRect.left : clientRect.right - width + 1, clientRect.bottom - bottomSpace, width, bottomSpace, bgColor);
+			dc.moveTo(!layout.rightAlign ?
+				clientRect.left + width - 1 : clientRect.right - width, clientRect.bottom - bottomSpace);
+			dc.lineTo(!layout.rightAlign ? clientRect.left + width - 1 : clientRect.right - width, clientRect.bottom);
+		}
+
+		dc.selectObject(oldPen);
+		if(!layout.rightAlign)	clientRect.left += width;
+		else					clientRect.right -= width;
+	}
+
+	// 行番号
+	if(layout.lineNumberLayout.showLineNumbers) {
+		char_t		lineNumberString[32];
+		const long	width = layoutManager.getVerticalRulerWidth() - layout.lineNumberLayout.indicatorMarginWidth;
+		RECT		rect, digitsRect;	// 行番号エリア全体と数字描画の矩形
+		length_t	logicalStartLine, dummy;
+		const UINT	drawTextFlags = DT_NOCLIP | DT_TOP | (!layout.rightAlign ? DT_RIGHT : DT_LEFT) | DT_SINGLELINE;
+
+		dc.setTextCharacterExtra(0);	// 行番号表示は文字間隔の設定を無視
+		getDisplayLineOffsetIndex(startLine, logicalStartLine, dummy);
+
+		rect = clientRect;
+		if(!layout.rightAlign) {	// 左寄せ
+			rect.right = rect.left + width;
+			digitsRect.left = rect.left;
+			digitsRect.right = rect.right - 4;
+			if(layout.lineNumberLayout.borderStyle != LineNumberLayout::LNBS_NONE)
+				digitsRect.right -= layout.lineNumberLayout.borderWidth;
+		} else {	// 右寄せ
+			rect.left = rect.right - width + 1;
+			digitsRect.right = rect.right;
+			digitsRect.left = rect.left + 4;
+			if(layout.lineNumberLayout.borderStyle != LineNumberLayout::LNBS_NONE)
+				digitsRect.left += layout.lineNumberLayout.borderWidth;
+		}
+		dc.setBkMode(OPAQUE);
+
+		// 上余白
+		if(layout.topMargin != 0)
+			dc.fillSolidRect(rect.left, clientRect.top,
+				rect.right - rect.left, layout.topMargin,
+				layoutManager.getTokenFoundation(ETT_LINENUMBER, Token::NULL_COOKIE).bgColor);
+
+		if(layout.wrapMode == WPM_NONE) {
+			// 行部分を1行ずつ描画
+			for(length_t line = startLine; line <= endLine; ++line) {
+				swprintf(lineNumberString, L"%lu", line + layout.lineNumberLayout.startLine);
+				rect.top = digitsRect.top = static_cast<int>(line - scrollInfo_.getY()) * lineHeight + layout.topMargin;
+				rect.bottom = digitsRect.bottom = rect.top + lineHeight;
+
+				const EmphaticTextType type = getDocument().getLineInfo(line).isModified() ? ETT_EMPHATIC_LINENUMBER : ETT_LINENUMBER;
+				const TextFoundation foundation = layoutManager.getTokenFoundation(type, Token::NULL_COOKIE);
+
+				// フォントなどの選択
+				dc.setTextColor(foundation.fgColor);
+				dc.setBkColor(foundation.bgColor);
+				HFONT oldFont = dc.selectObject(layoutManager.getFontForRenderingToken(type, Token::NULL_COOKIE));
+				dc.fillSolidRect(rect.left, rect.top,
+					rect.right - rect.left, layoutManager.getLineHeight(), foundation.bgColor);
+				dc.drawText(lineNumberString, -1, digitsRect, drawTextFlags);
+				dc.selectObject(oldFont);
+			}
+
+			// 下余白
+			if(bottomSpace > 0)
+				dc.fillSolidRect(rect.left, clientRect.bottom - bottomSpace,
+					rect.right - rect.left, bottomSpace,
+					layoutManager.getTokenFoundation(ETT_LINENUMBER, Token::NULL_COOKIE).bgColor);
+		} else {	// 折り返しを考慮する場合
+/*			length_t			iLine = iStart;
+			length_t			iLogicalLine;
+			length_t			iOffset;
+			EmphaticTextType	type;
+			TTextFoundation		foundation;
+
+			GetDisplayLineOffsetIndex(iStart * m_scrollInfo.nVerticalRatio, iLogicalLine, iOffset);
+			CLineLayout*			pLine = layoutManager.GetLine(iLogicalLine);
+			const WrappedOffsets*	pWrappedOffsets = pLine->GetWrappedPoints();
+			assert(pWrappedOffsets != 0);
+			while(iLine <= iEnd && pLine != 0) {
+				type = it->IsModified() ? ETT_EMPHATIC_LINENUMBER : ETT_LINENUMBER;
+				if(iOffset >= pWrappedOffsets->size() + 1) {	// 次の論理行へ進む
+					++iLogicalLine;
+					++it;
+					type = it->IsModified() ? ETT_EMPHATIC_LINENUMBER : ETT_LINENUMBER;
+					foundation = layoutManager.GetTokenFoundation(type, NullCookie);
+					iOffset = 0;
+					pLine = layoutManager.GetLine(iLogicalLine);
+					continue;
+				}
+				if(iOffset == 0) {
+					swprintf(wszLineNumber, L"%lu", iLogicalLine + layout.lineNumberLayout.iStartLine);
+					rcLineNumber.top = rcLineNumberDraw.top
+						= (iLine - m_scrollInfo.GetY()) * layoutManager.GetLineHeight() + layout.nTopMargin;
+					rcLineNumber.bottom = rcLineNumberDraw.bottom = rcLineNumber.top + nLineHeight;
+
+					// フォントなどの選択
+					dc.SetTextColor(foundation.fgColor);
+					dc.SetBkColor(foundation.bgColor);
+					HFONT	hOldFont = dc.SelectObject(layoutManager.GetFontForRenderingToken(type, NullCookie));
+					dc.FillSolidRect(rcLineNumberDraw.right, rcLineNumber.top,
+						rcLineNumber.right - rcLineNumberDraw.right, nLineHeight, foundation.bgColor);
+					dc.DrawText(wszLineNumber, -1, rcLineNumberDraw, DT_TOP | DT_RIGHT | DT_SINGLELINE);
+					dc.SelectObject(hOldFont);
+				}
+				++iLine;
+				++iOffset;
+			}
+*/		}
+
+		// 行番号の境界線の描画
+		if(layout.lineNumberLayout.borderStyle != LineNumberLayout::LNBS_NONE) {
+			const int xBorder = (!layout.rightAlign ? rect.right : rect.left) - layout.lineNumberLayout.borderWidth / 2 - 1;
+			HPEN oldPen = dc.selectObject(sharedData_->gdiObjects.lineNumberPen);
+			dc.moveTo(xBorder, clientRect.top);
+			dc.lineTo(xBorder, clientRect.bottom);
+			dc.selectObject(oldPen);
+#ifdef _DEBUG
+			if(DIAGNOSE_INHERENT_DRAWING) {
+				const RECT& r = dc.getPaintStruct().rcPaint;
+				dout << L"ruler rect : " << r.top << L" ... " << r.bottom << L"\n";
+			}
+#endif /* _DEBUG */
+		}
+	}
+}
+
+/// @see IDropTarget::Drop
+STDMETHODIMP EditView::Drop(IDataObject* pDataObj, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect) {
+	if(pDataObj == 0)
+		return E_INVALIDARG;
+	VERIFY_POINTER(pdwEffect);
+
+	*pdwEffect = DROPEFFECT_NONE;
+	if(mouseOperationDisabledCount_ != 0)
+		return S_OK;
+
+	EditDoc& document = getDocument();
+
+	if(leftDownMode_ == LDM_DRAGANDDROP) {	// 他コントローラからのデータ
+		FORMATETC fe = {CF_UNICODETEXT, 0, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+		STGMEDIUM stm = {TYMED_HGLOBAL, 0};
+		POINT caretPoint = {pt.x, pt.y};
+
+		killTimer(TIMERID_DRAGSCROLL);
+		screenToClient(caretPoint);
+		const CharPos pos = charFromPos(caretPoint,
+			!sharedData_->options.behavior[ACCEPT_CARET_ON_EXTENDER_BY_MOUSE]);
+		getSelection().moveTo(pos, true);
+		const UINT boxClipFormat = ::RegisterClipboardFormatW(ASCENSION_RECTANGLE_TEXT_CLIP_FORMAT);
+
+		if(pDataObj->QueryGetData(&fe) == S_OK) {	// CF_UNICODETEXT サポート
+			if(SUCCEEDED(pDataObj->GetData(&fe, &stm))) {
+				const char_t* buffer = static_cast<char_t*>(::GlobalLock(stm.hGlobal));
+
+				document.endEditCollection();
+				freeze();
+				if(fe.cfFormat = boxClipFormat, pDataObj->QueryGetData(&fe) == S_OK) {	// 矩形ドロップ
+					document.beginEditCollection();
+					selection_->getActivePoint().insertBox(buffer);
+					document.endEditCollection();
+					selection_->select(pos, selection_->getActivePoint(), true, true);
+				} else {
+					selection_->getActivePoint().insert(buffer);
+					selection_->select(pos, selection_->getActivePoint(), false, true);
+				}
+				unfreeze();
+				::GlobalUnlock(stm.hGlobal);
+				::ReleaseStgMedium(&stm);
+				*pdwEffect = DROPEFFECT_COPY;
+			}
+		} else if(fe.cfFormat = CF_TEXT, pDataObj->QueryGetData(&fe) == S_OK) {	// CF_TEXT サポート
+			if(SUCCEEDED(pDataObj->GetData(&fe, &stm))) {
+				const char* nativeBuffer = static_cast<char*>(::GlobalLock(stm.hGlobal));
+				const length_t len = min<length_t>(strlen(nativeBuffer), ::GlobalSize(stm.hGlobal) / sizeof(char));
+				char_t* buffer = new char_t[len];
+
+				::MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, nativeBuffer, -1, buffer, static_cast<int>(len));
+				freeze();
+				if(fe.cfFormat = boxClipFormat, pDataObj->QueryGetData(&fe) == S_OK) {	// 矩形ドロップ
+					document.beginEditCollection();
+					selection_->getActivePoint().insertBox(string_t(buffer, len));
+					document.endEditCollection();
+					selection_->select(pos, selection_->getActivePoint(), true, true);
+				} else {
+					selection_->getActivePoint().insert(string_t(buffer, len));
+					selection_->select(pos, selection_->getActivePoint(), false, true);
+				}
+				unfreeze();
+				delete[] buffer;
+				::GlobalUnlock(stm.hGlobal);
+				::ReleaseStgMedium(&stm);
+				*pdwEffect = DROPEFFECT_COPY;
+			}
+		}
+	} else if(leftDownMode_ == LDM_DRAGANDDROPSELF
+			|| leftDownMode_ == LDM_DRAGANDDROPBOXSELF) {	// 自プロセスからのデータ (pDataObj を使わない簡単な処理)
+		string_t text = selection_->getText(LBRP_PHYSICAL_DATA);
+		POINT caretPoint = {pt.x, pt.y};
+
+		screenToClient(caretPoint);
+		const CharPos pos = charFromPos(caretPoint, !sharedData_->options.behavior[ACCEPT_CARET_ON_EXTENDER_BY_MOUSE]);
+
+		// 自プロセスのデータは選択範囲上にドロップ不可
+		if(selection_->isPointOver(caretPoint)) {
+			*pdwEffect = DROPEFFECT_NONE;
+			leftDownMode_ = LDM_NONE;
+			getSelection().moveTo(pos, true);
+			return S_OK;
+		}
+
+		BEGIN_OPERATION_SEQUENCE();
+
+		if(toBoolean(grfKeyState & MK_CONTROL)) {	// 複写
+			invalidateLines(selection_->getAnchorPoint().getLineNumber(), selection_->getActivePoint().getLineNumber());
+			selection_->getActivePoint().moveTo(pos);
+			if(leftDownMode_ == LDM_DRAGANDDROPBOXSELF) {	// 矩形複写
+				selection_->getActivePoint().insertBox(text);
+				selection_->select(pos, selection_->getActivePoint(), true, true);
+			} else {	// 線形複写
+				selection_->getActivePoint().insert(text);
+				selection_->select(pos, selection_->getActivePoint(), false, true);
+			}
+			*pdwEffect = DROPEFFECT_COPY;
+		} else if(leftDownMode_ == LDM_DRAGANDDROPBOXSELF) {	// 矩形移動
+			auto_ptr<SynchronizablePoint> insertPoint(document.createSynchronizablePoint());
+
+			insertPoint->synchronizeWithDocumentUpdate(true);
+			insertPoint->moveTo(pos);
+			selection_->erase();
+			insertPoint->synchronizeWithDocumentUpdate(false);
+			selection_->getActivePoint().moveTo(*insertPoint);
+			selection_->getActivePoint().insertBox(text);
+			selection_->select(*insertPoint, selection_->getActivePoint(), true, true);
+			*pdwEffect = DROPEFFECT_MOVE;
+		} else {	// 移動
+			auto_ptr<VisualPoint> activePointOrg(getDocument().createEditPoint());
+			const CharPos anchorPointOrg = selection_->getAnchorPoint();
+
+			activePointOrg->synchronizeWithDocumentUpdate(true);
+			activePointOrg->moveTo(selection_->getActivePoint());
+			getSelection().moveTo(pos, true);
+			activePointOrg->erase(anchorPointOrg);
+			const CharPos temp = selection_->getActivePoint();
+			selection_->getActivePoint().insert(text);
+			selection_->select(temp, selection_->getActivePoint(), false, true);
+			*pdwEffect = DROPEFFECT_MOVE;
+		}
+		END_OPERATION_SEQUENCE();
+//		selection_->activePoint_.reveal();
+		lastOperation_.set(EditOperation::PASTE, selection_->getActivePoint());
+	}
+	leftDownMode_ = LDM_NONE;
+	return S_OK;
+}
+
+/**
+ *	自動スクロールを終了する
+ *	@return このメソッド呼び出しで自動スクロールを終了した場合 true
+ */
+bool EditView::endAutoScroll() {
+	assertValidAsWindow();
+
+	if(autoScroll_.scrolling) {
+		killTimer(TIMERID_AUTOSCROLL);
+		autoScroll_.scrolling = false;
+		autoScrollOriginMark_->showWindow(SW_HIDE);
+		releaseCapture();
+		return true;
+	}
+	return false;
+}
+
+/**
+ *	キャレット直前の単語を短縮語として展開する
+ *	@return 展開できた場合 true
+ */
+bool EditView::expandPrecedingWordAsAbbreviation() {
+	if(!modeState_.readyToExpandAbbrev)
+		return false;
+
+	bool succeeded = false;
+
+	// [Shift] キーを押していると展開を抑止できる
+	if(!toBoolean(::GetAsyncKeyState(VK_SHIFT) & 0x8000)) {
+		const string_t abbrev = getPrecedingWord(getAbbreviations().maxAbbreviationLength_);
+		const string_t expanded = getAbbreviations().expand(abbrev);
+		if(!expanded.empty()) {
+			// このキャストは多分安全だろう
+			selection_->getActivePoint().erase(-static_cast<signed_length_t>(abbrev.length()), EditPoint::CCC_UTF16);
+			selection_->getActivePoint().insert(expanded);
+			succeeded = true;
+		}
+	}
+	modeState_.readyToExpandAbbrev = false;
+	for(set<IEditViewEventListener*>::iterator it =
+			sharedData_->eventListeners.begin(); it != sharedData_->eventListeners.end(); ++it)
+		(*it)->onChangedAbbreviationExpansionReadyState(false, L"");
+	return succeeded;
+}
+
+/**
+ *	@brief 対括弧を探す。@a pos に括弧が無ければ常に false を返す
+ *
+ *	このメソッドは長さが1のトークンしか調べない。
+ *	このメソッドはアクセス可能領域の括弧しか考慮しない
+ *
+ *	@param pos				括弧の位置
+ *	@param foundPosition	見つかった対括弧の位置
+ *	@param requireBody		対応する括弧対の間に、
+ *							空白類文字以外のトークンが無い場合に見つからないことにする場合 true
+ *	@return					見つかったとき真
+ */
+bool EditView::findMatchBracket(const CharPos& pos, CharPos& foundPosition, bool requireBody) const {
+	assertValid();
+
+	const string_t& currentLine = getDocument().getLine(pos.line_);
+
+	if(pos.char_ >= currentLine.length())
+		return false;
+
+	char_t bracket = currentLine.at(pos.char_), match;	// 括弧と対括弧
+	bool backward;										// 括弧を探す方向
+
+	if(!getLexer().getBracketTraits(bracket, match, backward) || charIsInCommentOrQuotation(pos))
+		return false;
+	backward = !backward;
+
+	const EditDoc&	document = getDocument();
+	length_t		column = !backward ? pos.char_ + 1 : pos.char_ - 1;
+	ulong			nestLevel = 0;			// 入れ子レベル
+	length_t		searchedLineCount = 0;	// 検索した行数
+	bool			foundRatherThanSpace = !requireBody;	// 括弧と空白類文字以外のトークンを
+															// 一度でも読み飛ばしたか
+
+	for(length_t i = pos.line_; ;) {	// 論理行ループ
+		const string_t&	line = document.getLine(i);
+
+		if(!line.empty()) {
+			const Tokens& tokens = sharedData_->layoutManager.getLine(i).getTokens();
+			size_t tokenIndex = !backward ? 0 : tokens.count - 1;
+			if(searchedLineCount == 0) {
+				for(tokenIndex = 0; tokenIndex < tokens.count - 1; ++tokenIndex) {
+					if(tokens.array[tokenIndex].getIndex() == pos.char_)
+						break;
+				}
+			}
+
+			while(true) {	// 括弧を探す
+				const Token& token = tokens.array[tokenIndex];
+				const length_t tokenLength = (tokenIndex != tokens.count - 1) ?
+									tokens.array[tokenIndex + 1].getIndex() - tokens.array[tokenIndex].getIndex()
+									: line.length() - tokens.array[tokens.count - 1].getIndex();
+				if(tokenLength == 1
+						&& token.getType() != Token::ANNOTATION
+						&& token.getType() != Token::DOUBLE_QUOTATION
+						&& token.getType() != Token::SINGLE_QUOTATION) {
+					if(line[token.getIndex()] == bracket)
+						++nestLevel;
+					else if(line[token.getIndex()] == match && --nestLevel == 0) {
+						if(foundRatherThanSpace) {
+							foundPosition = CharPos(i, token.getIndex());
+							return true;
+						} else
+							return false;
+					} else if(token.getType() != Token::TAB && token.getType() != Token::WHITESPACE)
+						foundRatherThanSpace = true;
+				} else if(token.getType() != Token::TAB && token.getType() != Token::WHITESPACE)
+					foundRatherThanSpace = true;
+				if((!backward && tokenIndex == tokens.count - 1) || (backward && tokenIndex == 0))
+					break;
+				tokenIndex += !backward ? 1 : -1;
+			}
+		}
+
+		if(++searchedLineCount >= sharedData_->options.recognizingLineCount)
+			return false;
+		if((backward && i == 0) || (!backward && i == document.getLineCount() - 1))
+			return false;
+		i += !backward ? 1 : -1;
+	}
+
+	return false;
+}
+
+/// 描画の凍結
+/// @see EditView::isFreezed, EditView::unfreeze
+void EditView::freeze() {
+	assertValidAsWindow();
+	FOR_EACH_CLONES() {
+		if(++it->freezeInfo_.count == 1)
+			it->freezeInfo_.scrollPosition.x = it->freezeInfo_.scrollPosition.y = -1;
+	}
+}
+
+#ifndef ASCENSION_NO_ACTIVE_ACCESSIBILITY
+/// アクセシブルオブジェクトを得る
+HRESULT EditView::getAccessibleObject(IAccessible*& acc) const throw() {
+	assertValid();
+	EditView& self = *const_cast<EditView*>(this);
+	acc = 0;
+	if(accessibleProxy_ == 0 && isWindow() && accLib.isAvailable()) {
+		if(self.accessibleProxy_ = new AccessibleProxy(self)) {
+			self.accessibleProxy_->AddRef();
+//			accLib.notifyWinEvent(EVENT_OBJECT_CREATE, *this, OBJID_CLIENT, CHILDID_SELF);
+		} else
+			return E_OUTOFMEMORY;
+	}
+	if(accessibleProxy_ == 0)
+		return E_FAIL;
+	(acc = self.accessibleProxy_)->AddRef();
+	return S_OK;
+}
+#endif /* !ASCENSION_NO_ACTIVE_ACCESSIBILITY */
+
+/// 総表示行数を返す
+length_t EditView::getDisplayLineCount() const {
+	assertValid();
+
+//	if(modeState_.wrapMode == WPM_NONE)
+		return getDocument().getLineCount();
+/*
+	length_t displayLineCount = 0;
+	LineLayout* layout = m_pLineLayoutManager->GetLine(0);
+	while(pInfo != 0) {
+		cDisplayLines += pInfo->m_vecWrappedOffsets.size() + 1;
+		pInfo = pInfo->m_pNext;
+	}
+	return cDisplayLines;*/
+}
+
+/**
+ *	表示行が論理行のどのオフセットに相当するかを返す
+ *	@param displayLine	表示行
+ *	@param logicalLine	[out] 論理行 (@a displayLine が無効な場合は-1)
+ *	@param offset		[out] 論理行中で何番目の表示行か (@a displayLine が無効な場合は-1)
+ */
+void EditView::getDisplayLineOffsetIndex(length_t displayLine, length_t& logicalLine, length_t& offset) const {
+	assertValid();
+
+//	if(modeState_.wrapMode == WPM_NONE) {
+		logicalLine = displayLine;
+		offset = 0;
+/*		return;
+	} else {
+		CLineLayoutInfo*	pInfo = m_pLineLayoutManager->GetLine(0);
+		length_t			iTotalDisplayLine = 0;
+
+		iLogicalLine = 0;
+		while(pInfo != 0) {
+			if(iTotalDisplayLine + pInfo->m_vecWrappedOffsets.size() + 1 > iDisplayLine) {
+				iOffset = iDisplayLine - iTotalDisplayLine;
+				return;
+			}
+			iTotalDisplayLine += pInfo->m_vecWrappedOffsets.size() + 1;
+			pInfo = pInfo->m_pNext;
+			++iLogicalLine;
+		}
+	}
+	iLogicalLine = iOffset = -1;*/
+}
+
+/**
+ *	@brief 指定位置付近にある単語の位置などを返す
+ *
+ *	このメソッドは設定されている識別子判定の影響を受け、
+ *	返される文字列は識別子の2文字目以降として有効な文字のみからなる。
+ *	出力引数で結果の必要の無いものは null を指定してもよい
+ *	@param pos			位置
+ *	@param startChar	[out] 単語の先頭位置
+ *	@param endChar		[out] 単語の終端位置
+ *	@param word			[out] 見つかった単語
+ *	@return				単語が見つからない場合は false を返す。その場合各出力引数の値は未定義
+ *	@see				getNearesetWordFromCaret, getNearestWordFromCursor
+ */
+bool EditView::getNearestWord(const CharPos& pos, length_t* startChar, length_t* endChar, string_t* word) const {
+	assertValid();
+
+	const Lexer& lexer = sharedData_->layoutManager.getLexer();
+	length_t startColumn, endColumn;
+	const string_t& line = getDocument().getLine(selection_->getActivePoint().getLineNumber());
+	CodePoint cp;
+
+	startColumn = endColumn = pos.char_;
+
+	// 開始位置を調べる
+	if(startChar != 0 || word != 0) {
+		while(startColumn > 0) {
+			if(UTF16Surrogates::isLowSurrogate(line[startColumn - 1])
+					&& startColumn > 1
+					&& UTF16Surrogates::isHighSurrogate(line[startColumn - 2]))
+				cp = UTF16Surrogates::decode(line.data() + startColumn - 2, 2);
+			else
+				cp = line[startColumn - 1];
+			if(lexer.isIdentifierContinueCodePoint(cp))
+				startColumn -= ((cp >= 0x010000) ? 2 : 1);
+			else
+				break;
+		}
+		if(startChar!= 0)
+			*startChar = startColumn;
+	}
+
+	// 終了位置を調べる
+	if(endChar != 0 || word != 0) {
+		while(true) {
+			if(UTF16Surrogates::isHighSurrogate(line[endColumn])
+					&& endColumn < line.length() - 1
+					&& UTF16Surrogates::isLowSurrogate(line[endColumn + 1]))
+				cp = UTF16Surrogates::decode(line.data() + endColumn, 2);
+			else
+				cp = line[endColumn];
+			if(lexer.isIdentifierContinueCodePoint(cp))
+				endColumn += ((cp >= 0x010000) ? 2 : 1);
+			else
+				break;
+		}
+		if(endChar != 0)
+			*endChar = endColumn;
+	}
+
+	if(word != 0)
+		word->assign(line.substr(startColumn, endColumn - startColumn));
+	return true;
+}
+
+/**
+ *	キャレット付近にある単語の位置などを返す
+ *	@param startPos	[out] 単語の先頭位置
+ *	@param endPos	[out] 単語の終端位置
+ *	@param word		[out] 見つかった単語
+ *	@return			単語が見つからない場合や、選択がある場合は false を返す。その場合各出力引数の値は未定義
+ *	@see			getNearestWordFromCursor, getPrecedingWord
+ */
+bool EditView::getNearestWordFromCaret(CharPos* startPos, CharPos* endPos, string_t* word) const {
+	assertValid();
+
+	if(!selection_->isEmpty())
+		return false;
+	if(getNearestWord(selection_->getActivePoint(),
+			(startPos != 0) ? &startPos->char_ : 0, (endPos != 0) ? &endPos->char_ : 0, word)) {
+		if(startPos != 0)	startPos->line_ = selection_->getActivePoint().getLineNumber();
+		if(endPos != 0)		endPos->line_ = selection_->getActivePoint().getLineNumber();
+		return true;
+	}
+	return false;
+}
+
+/**
+ *	カーソル付近にある単語の位置などを返す
+ *	@param startPos	[out] 単語の先頭位置
+ *	@param endPos	[out] 単語の終端位置
+ *	@param word		[out] 見つかった単語
+ *	@return			単語が見つからない場合は false を返す。その場合各出力引数の値は未定義
+ *	@see			getNearestWordFromCaret, getPrecedingWord
+ */
+bool EditView::getNearestWordFromCursor(CharPos* startPos, CharPos* endPos, string_t* word) const {
+	assertValidAsWindow();
+
+	POINT cursorPoint;
+	::GetCursorPos(&cursorPoint);
+	screenToClient(cursorPoint);
+	const CharPos cursor = charFromPos(cursorPoint, false);
+
+	if(getNearestWord(cursor,
+			(startPos != 0) ? &startPos->char_ : 0, (endPos != 0) ? &endPos->char_ : 0, word)) {
+		if(startPos != 0)	startPos->line_ = cursor.line_;
+		if(endPos != 0)		endPos->line_ = cursor.line_;
+		return true;
+	}
+	return false;
+}
+
+/**
+ *	@brief キャレットの直前にある単語を返す
+ *
+ *	このメソッドは設定されている識別子判定の影響を受け、
+ *	返される文字列は識別子の2文字目以降として有効な文字のみからなる。
+ *	単語が見つからない場合や、選択がある場合、
+ *	或いは単語が指定した @a maxLength で指定した最高文字数を超えた場合は空文字列を返す
+ *	@see getNearestWordFromCaret, getNearestWordFromCursor
+ */
+string_t EditView::getPrecedingWord(length_t maxLength) const {
+	assertValid();
+
+	if(!selection_->isEmpty()
+			|| selection_->getActivePoint().getCharNumber() == 0
+			|| (getDocument().isNarrowed() && selection_->getActivePoint().getPosition() == getDocument().getStartPoint()))
+		return L"";
+	const string_t& line = getDocument().getLine(selection_->getActivePoint().getLineNumber());
+	CodePoint cp;
+
+	length_t i = selection_->getActivePoint().getCharNumber();
+	while(i != 0) {
+		if(selection_->getActivePoint().getCharNumber() - i + 1 > maxLength)
+			return L"";
+		if(UTF16Surrogates::isLowSurrogate(line[i - 1])
+				&& i > 1
+				&& UTF16Surrogates::isHighSurrogate(line[i - 2]))
+			cp = UTF16Surrogates::decode(line.data() + i - 2, 2);
+		else
+			cp = line[i - 1];
+		if(getLexer().isIdentifierContinueCodePoint(cp))
+			i -= ((cp >= 0x010000) ? 2 : 1);
+		else
+			break;
+	}
+	return line.substr(i, selection_->getActivePoint().getCharNumber() - i);
+}
+
+/// @see IDropSource::GiveFeedback
+STDMETHODIMP EditView::GiveFeedback(DWORD dwEffect) {
+	assertValid();
+	return DRAGDROP_S_USEDEFAULTCURSORS;	// システムのデフォルトのカーソルを使う 
+}
+
+/// 表示中のツールチップを非表示にする
+void EditView::hideToolTip() {
+	assertValidAsWindow();
+
+	if(tipText_ == 0)
+		tipText_ = new char_t[1];
+	wcscpy(tipText_, L"");
+	killTimer(TIMERID_CALLTIP);	// 念のため...
+	::SendMessageW(toolTip_, TTM_UPDATE, 0, 0L);
+}
+
+/**
+ *	現在の検索条件に一致するテキストを強調表示する
+ *	@param highlight 強調表示を有効にする場合 true。無効にする場合 false
+ */
+void EditView::highlightMatchTexts(bool highlight) {
+	assertValid();
+	if(this != originalView_)
+		originalView_->highlightMatchTexts(highlight);
+	else {
+		sharedData_->highlightMatches = true;
+		if(sharedData_->options.appearance[HIGHLIGHT_MATCH_TEXT]) {
+			invalidateRect(0, false);
+			FOR_EACH_CLONES()
+				it->invalidateRect(0, false);
+		}
+	}
+}
+
+/**
+ *	指定位置がエディタウィンドウのどの部分にあるかを調べる
+ *	@param pt	調べる位置。クライアント座標
+ *	@return		結果
+ *	@see		HitTestResult
+ */
+HitTestResult EditView::hitTest(const POINT& pt) const {
+	assertValidAsWindow();
+
+	const LayoutSettings& layout = getLayoutSetter().getSettings();
+	RECT clientRect;
+
+	getClientRect(clientRect);
+	if(!toBoolean(::PtInRect(&clientRect, pt)))
+		return HTR_OUTOFVIEW;
+
+	if(layout.lineNumberLayout.showIndicatorMargin
+			&& ((!layout.rightAlign && pt.x < layout.lineNumberLayout.indicatorMarginWidth)
+			|| (layout.rightAlign && pt.x >= clientRect.right - layout.lineNumberLayout.indicatorMarginWidth)))
+		return HTR_INDICATORMARGIN;
+	else if(layout.lineNumberLayout.showLineNumbers
+			&& ((!layout.rightAlign && pt.x < getLayoutSetter().getVerticalRulerWidth())
+			|| (layout.rightAlign && pt.x >= clientRect.right - getLayoutSetter().getVerticalRulerWidth())))
+		return HTR_LINENUMBERS;
+	else if((!layout.rightAlign && pt.x < getLayoutSetter().getVerticalRulerWidth() + layout.leadMargin)
+			|| (layout.rightAlign && pt.x >= clientRect.right - getLayoutSetter().getVerticalRulerWidth() - layout.leadMargin))
+		return HTR_LEADMARGIN;
+	else if(pt.y < layout.topMargin)
+		return HTR_TOPMARGIN;
+	else
+		return HTR_TEXT;
+}
+
+/**
+ *	ウィンドウの初期化
+ *	@param copyConstructing 複製ビューから呼び出される場合 true
+ */
+void EditView::initializeWindow(bool copyConstructing) {
+	assertValidAsWindow();
+
+	// コンテキストメニューのラベル
+	static const WCHAR* menuLabels[] = {
+		L"&Undo",								L"元に戻す(&U)",
+		L"&Redo",								L"やり直し(&R)",
+		0,										0,
+		L"Cu&t",								L"切り取り(&T)",
+		L"&Copy",								L"コピー(&C)",
+		L"&Paste",								L"貼り付け(&P)",
+		L"&Delete",								L"削除(&D)",
+		0,										0,
+		L"Select &All",							L"すべて選択(&A)",
+		0,										0,
+		L"&Right to left Reading order",		L"右から左に読む(&R)",
+		L"&Show Unicode control characters",	L"Unicode 制御文字の表示(&S)",
+		L"&Insert Unicode control character",	L"Unicode 制御文字の挿入(&I)",
+		L"Insert Unicode &whitespace character",L"Unicode 空白文字の挿入(&W)",
+	};																		
+
+	// 標準コンテキストメニューの作成。Ascension では
+	// GUI でテキストを使う数少ない事例。日本語以外にも対応してみる
+	// 英語以外に翻訳してくれる人募集中 (^^
+	if(!copyConstructing) {
+		using Manah::Windows::Controls::Menu;
+		Menu& menu = sharedData_->contextMenu;
+		const bool	isJapanese = PRIMARYLANGID(getUserDefaultUILanguage()) == LANG_JAPANESE;
+
+#define GET_CAPTION(index)	menuLabels[(index) * 2 + (isJapanese ? 1 : 0)]
+		menu << Menu::StringItem(WM_UNDO, GET_CAPTION(0))
+			<< Menu::StringItem(WM_REDO, GET_CAPTION(1))
+			<< Menu::SeparatorItem()
+			<< Menu::StringItem(WM_CUT, GET_CAPTION(3))
+			<< Menu::StringItem(WM_COPY, GET_CAPTION(4))
+			<< Menu::StringItem(WM_PASTE, GET_CAPTION(5))
+			<< Menu::StringItem(WM_CLEAR, GET_CAPTION(6))
+			<< Menu::SeparatorItem()
+			<< Menu::StringItem(WM_SELECTALL, GET_CAPTION(8))
+			<< Menu::SeparatorItem()
+			<< Menu::StringItem(ID_RTLREADING, GET_CAPTION(10))
+			<< Menu::StringItem(ID_SHOWDIRECTIONALFORMATTERS, GET_CAPTION(11))
+			<< Menu::StringItem(0, GET_CAPTION(12))
+			<< Menu::StringItem(0, GET_CAPTION(13));
+#undef GET_CAPTION
+
+		// [Unicode 制御文字の挿入] 以下
+		Menu* subMenu = new Menu;
+		*subMenu << Menu::StringItem(ID_INSERT_LRM, L"LRM\t&Left-To-Right Mark")
+			<< Menu::StringItem(ID_INSERT_RLM, L"RLM\t&Right-To-Left Mark")
+			<< Menu::StringItem(ID_INSERT_ZWJ, L"ZWJ\t&Zero Width Joiner")
+			<< Menu::StringItem(ID_INSERT_ZWNJ, L"ZWNJ\tZero Width &Non-Joiner")
+			<< Menu::StringItem(ID_INSERT_LRE, L"LRE\tLeft-To-Right &Embedding")
+			<< Menu::StringItem(ID_INSERT_RLE, L"RLE\tRight-To-Left E&mbedding")
+			<< Menu::StringItem(ID_INSERT_LRO, L"LRO\tLeft-To-Right &Override")
+			<< Menu::StringItem(ID_INSERT_RLO, L"RLO\tRight-To-Left O&verride")
+			<< Menu::StringItem(ID_INSERT_PDF, L"PDF\t&Pop Directional Formatting")
+			<< Menu::StringItem(ID_INSERT_WJ, L"WJ\t&Word Joiner")
+			<< Menu::StringItem(ID_INSERT_NADS, L"NADS\tN&ational Digit Shapes (deprecated)")
+			<< Menu::StringItem(ID_INSERT_NODS, L"NODS\tNominal &Digit Shapes (deprecated)")
+			<< Menu::StringItem(ID_INSERT_ASS, L"ASS\tActivate &Symmetric Swapping (deprecated)")
+			<< Menu::StringItem(ID_INSERT_ISS, L"ISS\tInhibit S&ymmetric Swapping (deprecated)")
+			<< Menu::StringItem(ID_INSERT_AAFS, L"AAFS\tActivate Arabic &Form Shaping (deprecated)")
+			<< Menu::StringItem(ID_INSERT_IAFS, L"IAFS\tInhibit Arabic Form S&haping (deprecated)")
+			<< Menu::StringItem(ID_INSERT_RS, L"RS\tRe&cord Separator")
+			<< Menu::StringItem(ID_INSERT_US, L"US\tUnit &Separator")
+			<< Menu::SeparatorItem()
+			<< Menu::StringItem(ID_INSERT_IAA, L"IAA\tInterlinear Annotation Anchor")
+			<< Menu::StringItem(ID_INSERT_IAT, L"IAT\tInterlinear Annotation Terminator")
+			<< Menu::StringItem(ID_INSERT_IAS, L"IAS\tInterlinear Annotation Separator");
+		menu.setChildPopup<Menu::BY_POSITION>(12, *subMenu);
+
+		// [Unicode 空白文字の挿入] 以下
+		subMenu = new Menu;
+		*subMenu << Menu::StringItem(ID_INSERT_U0020, L"U+0020\tSpace")
+			<< Menu::StringItem(ID_INSERT_NBSP, L"NBSP\tNo-Break Space")
+			<< Menu::StringItem(ID_INSERT_U1680, L"U+1680\tOgham Space Mark")
+			<< Menu::StringItem(ID_INSERT_MVS, L"MVS\tMongolian Vowel Separator")
+			<< Menu::StringItem(ID_INSERT_U2000, L"U+2000\tEn Quad")
+			<< Menu::StringItem(ID_INSERT_U2001, L"U+2001\tEm Quad")
+			<< Menu::StringItem(ID_INSERT_U2002, L"U+2002\tEn Space")
+			<< Menu::StringItem(ID_INSERT_U2003, L"U+2003\tEm Space")
+			<< Menu::StringItem(ID_INSERT_U2004, L"U+2004\tThree-Per-Em Space")
+			<< Menu::StringItem(ID_INSERT_U2005, L"U+2005\tFour-Per-Em Space")
+			<< Menu::StringItem(ID_INSERT_U2006, L"U+2006\tSix-Per-Em Space")
+			<< Menu::StringItem(ID_INSERT_U2007, L"U+2007\tFigure Space")
+			<< Menu::StringItem(ID_INSERT_U2008, L"U+2008\tPunctuation Space")
+			<< Menu::StringItem(ID_INSERT_U2009, L"U+2009\tThin Space")
+			<< Menu::StringItem(ID_INSERT_U200A, L"U+200A\tHair Space")
+			<< Menu::StringItem(ID_INSERT_ZWSP, L"ZWSP\tZero Width Space")
+			<< Menu::StringItem(ID_INSERT_NNBSP, L"NNBSP\tNarrow No-Break Space")
+			<< Menu::StringItem(ID_INSERT_MMSP, L"MMSP\tMedium Mathematical Space")
+			<< Menu::StringItem(ID_INSERT_U3000, L"U+3000\tIdeographic Space")
+			<< Menu::SeparatorItem()
+			<< Menu::StringItem(ID_INSERT_NEL, L"NEL\tNext Line")
+			<< Menu::StringItem(ID_INSERT_LS, L"LS\tLine Separator")
+			<< Menu::StringItem(ID_INSERT_PS, L"PS\tParagraph Separator");
+		menu.setChildPopup<Menu::BY_POSITION>(13, *subMenu);
+
+		// bidi サポートがあるか?
+		if(!sharedData_->layoutManager.isRTLSupported()) {
+			menu.enableMenuItem<Menu::BY_COMMAND>(ID_RTLREADING, false);
+			menu.enableMenuItem<Menu::BY_COMMAND>(ID_SHOWDIRECTIONALFORMATTERS, false);
+			menu.enableMenuItem<Menu::BY_POSITION>(12, false);
+			menu.enableMenuItem<Menu::BY_POSITION>(13, false);
+
+			// 未実装のコマンドを使用不可に
+//			menu.enableMenuItem<Menu::BY_COMMAND>(ID_RTLREADING, false);
+		}
+	} else {	// 他のビューから複製する場合
+		if(sharedData_->layoutManager.getSettings().rightToLeftReading)
+			onChangedTextDirection();
+		if(sharedData_->layoutManager.getSettings().rightAlign)
+			onChangedTextAlignment();
+	}
+
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+	// メモリデバイスコンテキストの用意
+	memDC_.createCompatibleDC(getDC().getSafeHdc());
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+
+	updateGDIObjects();
+//	if(copyConstructing)
+//		recalcLeftTabWidth();
+
+	// ツールチップの作成
+	toolTip_ = ::CreateWindowExW(
+		WS_EX_TOOLWINDOW | WS_EX_TOPMOST, TOOLTIPS_CLASSW, 0,
+		WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, getHandle(), 0,
+		reinterpret_cast<HINSTANCE>(static_cast<HANDLE_PTR>(::GetWindowLongPtr(getHandle(), GWLP_HINSTANCE))), 0);
+	if(toolTip_ != 0) {
+		AutoZeroCB<TOOLINFOW> ti;
+		RECT margins = {1, 1, 1, 1};
+
+		ti.hwnd = getHandle();
+		ti.lpszText = LPSTR_TEXTCALLBACKW;
+		ti.uFlags = TTF_SUBCLASS;
+		ti.uId = 1;
+		::SetRect(&ti.rect, 0, 0, 0, 0);
+		::SendMessageW(toolTip_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+		::SendMessageW(toolTip_, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000);	// 30秒間表示されるように
+//		::SendMessageW(toolTip_, TTM_SETDELAYTIME, TTDT_INITIAL, 1500);
+		::SendMessageW(toolTip_, TTM_SETMARGIN, 0, reinterpret_cast<LPARAM>(&margins));
+		::SendMessageW(toolTip_, TTM_ACTIVATE, true, 0L);
+	}
+
+	// 入力候補ウィンドウの作成
+	completionWindow_->create();
+
+	// 自動スクロールの原点ウィンドウの作成
+	autoScrollOriginMark_.reset(new AutoScrollOriginMark);
+	autoScrollOriginMark_->create(*this);
+	
+	// ドロップ対象に登録
+	registerDragDrop(*this);
+
+	// ドキュメントがあれば行情報を同期
+	if(!copyConstructing)
+		sharedData_->layoutManager.reconstructAll();
+}
+
+/**
+ *	@brief キャレット位置に1文字入力する
+ *
+ *	入力が空白類文字であれば短縮形の展開も行われる。
+ *	また、設定に応じて入力シーケンスのチェックも行われる
+ *
+ *	選択がある場合はその置換になる。上書きモードの場合も1文字の置換になる
+ *
+ *	一部を除いて制御文字は入力できない。水平タブ (U+0009) は入力可能で、選択がある場合はタブインデントになる
+ *
+ *	エディタにテキストが挿入されるときは常にこのメソッドが実行されるので、
+ *	このメソッドをオーバーライドすることであらゆるテキストの入力を捕捉できる
+ *	@param cp	文字のコードポイント
+ *	@return		入力が弾かれた場合 false
+ */
+bool EditView::inputCharacter(CodePoint cp) {
+	assertValid();
+
+	EditDoc& document = getDocument();
+
+	if(document.isReadOnly())
+		return false;
+
+//	bool doneSmartIndent = false;
+
+	// ASCII 制御文字は無視 (水平 TAB 、RS 、US 以外)
+	if(!sharedData_->options.behavior[ACCEPT_CONTROL_CHAR_INPUT]
+			&& cp <= 0xFF && cp != 0x09
+			&& cp != 0x1E && cp != 0x1F
+			&& toBoolean(iscntrl(static_cast<int>(cp)))) {
+//		beep();
+		return false;
+	}
+
+	// 入力シーケンスをチェック
+	if(sharedData_->options.sequenceCheckingLanguages != 0) {
+		const InputSequenceCheckLanguage languages = sharedData_->options.sequenceCheckingLanguages;
+		const EditPoint& topPoint = selection_->getStartPoint();
+		const char_t* const line = document.getLine(topPoint.getLineNumber()).c_str();
+
+		if(toBoolean(languages & ISCL_AINU)
+				&& !AinuInputSequenceChecker::check(line, line + topPoint.getCharNumber(), cp)) {
+			beep();
+			return false;
+		} else if(toBoolean(languages & ISCL_THAI)
+				&& !ThaiInputSequenceChecker::check(line, line + topPoint.getCharNumber(), cp)) {
+			beep();
+			return false;
+		} else if(toBoolean(languages & ISCL_VIETNAMESE)
+				&& !VietnameseInputSequenceChecker::check(line, line + topPoint.getCharNumber(), cp)) {
+			beep();
+			return false;
+		}
+	}
+
+	if(cp == 0x0009 && !selection_->isEmpty()) {	// [Tab]
+		StandardCommands::IndentationCommand(
+			*this, !toBoolean(::GetKeyState(VK_SHIFT) & 0x8000), true, 1).execute();
+		return true;
+	} else {
+		char_t buffer[2];
+
+		// 空白類文字が全て BMP にあると仮定している
+		if(cp < 0x010000)
+			buffer[0] = EditView::convertCharacter(static_cast<char_t>(cp), nextCharVariation_);
+		else
+			UTF16Surrogates::encode(cp, buffer);
+		if(!selection_->isEmpty()) {	// 選択がある場合 -> 単純な置換
+//			if(!modeState_.smartIndent || !smartIndent(cp))
+				getSelection().replace(buffer, buffer + ((cp < 0x10000) ? 1 : 2), false);
+			lastOperation_.set(EditOperation::REPLACE, selection_->getActivePoint());
+		} else if(modeState_.overtype) {	// 上書きモードの場合
+			if(!document.isCollectingEdit())
+				document.beginEditCollection();
+			freeze();
+			selection_->getAnchorPoint().destructiveInsert(buffer, buffer + ((cp < 0x10000) ? 1 : 2));
+//			getSelection().moveTo(selection_->getAnchorPoint(), true);
+			unfreeze();
+			updateCaretPosition();
+		} else {
+			const bool charIsAlpha = getLexer().isIdentifierContinueCodePoint(cp);
+			bool abbrIsExpanded = false;
+
+			// 単語構成文字以外なら入力補完を終了
+			if(!charIsAlpha && completionWindow_->isRunning())
+				completionWindow_->complete();
+
+			// 空白類文字の場合、短縮語を展開
+			if(getLexer().isWhiteSpace(cp, true)) {
+				freeze();
+				document.beginEditCollection();
+				expandPrecedingWordAsAbbreviation();
+				document.endEditCollection();
+				abbrIsExpanded = true;
+			}
+
+			// 連続した単語構成文字の入力を1つにまとめようと小細工する。
+			// あまり巧くいっていない
+			if(lastOperation_.type_ != EditOperation::TYPING
+					|| lastOperation_.pos_ != selection_->getActivePoint()
+					|| !charIsAlpha)
+				document.endEditCollection();
+			if(charIsAlpha && !document.isCollectingEdit())
+				document.beginEditCollection();
+
+			// 入力
+			selection_->getActivePoint().synchronizeAnchor().insert(buffer, buffer + ((cp < 0x10000) ? 1 : 2));
+//			selection_->moveTo(selection_->getAnchorPoint(), true);	// <-- これは無くても動くはずだが... (Win2000 だと駄目)
+			if(completionWindow_->isWindowVisible())
+				completionWindow_->updateListCursel();
+			lastOperation_.set(EditOperation::TYPING, selection_->getActivePoint());
+
+			if(abbrIsExpanded)
+				unfreeze();
+
+			// キャレット直前の単語が短縮語として展開可能か調べる
+			if(charIsAlpha && !isFreezed() && !getAbbreviations().abbreviations_.empty()) {
+				const string_t precWord = getPrecedingWord(getAbbreviations().maxAbbreviationLength_);
+
+				modeState_.readyToExpandAbbrev = false;
+				if(!precWord.empty()) {
+					map<string_t, string_t>::const_iterator it = getAbbreviations().abbreviations_.find(precWord);
+					modeState_.readyToExpandAbbrev = it != getAbbreviations().abbreviations_.end();
+				}
+				FOR_EACH_LISTENERS()
+					(*it)->onChangedAbbreviationExpansionReadyState(
+						modeState_.readyToExpandAbbrev,
+							modeState_.readyToExpandAbbrev ? precWord : L"");
+			}
+		}
+		selection_->getActivePoint().reveal(*this);
+	}
+
+	return true;
+}
+
+/**
+ *	@brief キャレット位置にテキストを挿入する
+ *
+ *	選択がある場合や上書きモードでは置換になる。
+ *	入力シーケンスのチェックや短縮形の展開は行われない
+ *
+ *	エディタにテキストが挿入されるときは常にこのメソッドが実行されるので、
+ *	このメソッドをオーバーライドすることであらゆるテキストの入力を捕捉できる
+ *	@param first, last	挿入するテキスト
+ *	@param asRectangle	矩形テキストとして挿入する場合 true
+ *	@return				入力が弾かれた場合 false
+ *	@see				EditView::inputCharacter, StandardCommand::TextInputCommand
+ */
+bool EditView::insertText(const char_t* first, const char_t* last, bool asRectangle) {
+	assertValid();
+	assert(first != 0 && last != 0 && first <= last);
+	if(getDocument().isReadOnly())
+		return false;
+
+	if(isOvertypeMode() && selection_->isEmpty())	// 上書きモードの場合 (適当)
+		selection_->select(selection_->getAnchorPoint(),
+			CharPos(selection_->getAnchorPoint().getLineNumber(),
+				selection_->getActivePoint().getCharNumber() + (last - first)),
+			false, false);
+
+	if(!selection_->isEmpty())
+		selection_->replace(first, last, asRectangle);
+	else {
+		BEGIN_OPERATION_SEQUENCE();
+		if(asRectangle)
+			selection_->getAnchorPoint().insertBox(first, last);
+		else
+			selection_->getAnchorPoint().insert(first, last);
+		selection_->moveTo(selection_->getAnchorPoint(), true);
+		END_OPERATION_SEQUENCE();
+	}
+	return true;
+}
+
+/**
+ *	@brief	キャレット位置にテキストを挿入する
+ *
+ *	ポインタ版と同じだが、このメソッドは利便性のために用意されたもので、
+ *	テキスト入力捕捉の目的でこのメソッドをオーバーライドしてはならない
+ *	@param text			挿入するテキスト
+ *	@param asRectangle	矩形テキストとして挿入する場合 true
+ *	@return				入力が弾かれた場合 false
+ */
+bool EditView::insertText(const string_t& text, bool asRectangle) {
+	assertValid();
+	return insertText(text.data(), text.data() + text.length(), asRectangle);
+}
+
+/**
+ *	指定区間行矩形を無効化
+ *	@param line	論理行
+ */
+void EditView::invalidateLine(length_t line) {
+	invalidateLines(line, line);
+}
+
+/**
+ *	指定行矩形を無効化
+ *	@param startLine, endLine 開始行、終了行。いずれも論理行。2つの値に大小関係に関する制限は無い
+ */
+void EditView::invalidateLines(length_t startLine, length_t endLine) {
+	assertValidAsWindow();
+
+	const length_t visibleLineCount = getVisibleLineCount();
+
+	if(startLine > endLine)
+		std::swap(startLine, endLine);
+	endLine = min<length_t>(endLine, scrollInfo_.position.y + visibleLineCount);
+
+	if(isFreezed()) {	// 凍結中
+		for(length_t i = startLine; i <= endLine; ++i)
+			freezeInfo_.invalidLines.insert(i);
+		return;
+	}
+	
+#ifdef _DEBUG
+	if(DIAGNOSE_INHERENT_DRAWING)
+		dout << L"inv : " << startLine << L".." << endLine << L"\n";
+#endif /* _DEBUG */
+
+	RECT rect;
+	length_t displayStartLine, displayEndLine;
+	const length_t lineCount = getDocument().getLineCount();
+
+	// 表示行に変換
+	if(startLine > endLine)
+		std::swap(startLine, endLine);
+	displayStartLine = displayLineFromLogicalLine(min(startLine, lineCount - 1));
+	if(startLine >= lineCount)
+		displayStartLine += startLine - lineCount + 1;
+	displayEndLine = displayLineFromLogicalLine(min(endLine, lineCount - 1));
+	if(endLine >= lineCount)
+		displayEndLine += endLine - lineCount + 1;
+	getClientRect(rect);
+
+	// 上端
+	if(displayStartLine > scrollInfo_.position.y + visibleLineCount)
+		return;
+	rect.top += getLayoutSetter().getSettings().topMargin;
+	if(static_cast<long>(displayStartLine) > scrollInfo_.position.y)
+		rect.top += static_cast<int>(displayStartLine - scrollInfo_.position.y) * sharedData_->layoutManager.getLineHeight();
+
+	// 下端
+	rect.bottom =
+		rect.top + static_cast<int>(displayEndLine - displayStartLine + 1) * sharedData_->layoutManager.getLineHeight();
+
+	invalidateRect(&rect, false);
+}
+
+/**
+ *	指定位置がリンク文字列と重なっているかどうかを返す
+ *	@param pt	クライアント座標
+ *	@param text	[out] @a pt がリンク文字列上にあればその文字列
+ *				(メールアドレスの場合は自動的に "mailto:" が先頭に追加される)。
+ *				呼び出し側が (@c delete[] で) 削除しなければならない
+ *	@return		@a pt がリンク文字列上にあれば true 
+ */
+bool EditView::isOverInvokableLink(const POINT& pt, char_t*& text) const {
+	// !この実装は折り返しのことを考えていない!
+	assertValidAsWindow();
+
+	bool truncated;
+	const CharPos pos = charFromPos(pt, true, &truncated);	// カーソル位置に最も近い文字位置
+
+	if(truncated)	// 指定位置に文字が無い
+		return false;
+
+	const char_t* const first = getDocument().getLine(pos.line_).data();
+	const char_t* const last = first + getDocument().getLineLength(pos.line_);
+	length_t linkLength;	// Lexer の eatMailAddress 、eatUrlString で見つけたリンクテキストの長さ
+
+	for(const char_t* p = (pos.char_ > 200) ? first + pos.char_ - 200 : first; p <= first + pos.char_; ) {
+		if(p != first) {
+			if((p[-1] >= L'A' && p[-1] <= L'Z')
+					|| (p[-1] >= L'a' && p[-1] <= L'z')
+					|| p[-1] == L'_') {
+				++p;
+				continue;
+			}
+		}
+		if(0 != (linkLength = URIDetector::eatURL(p, last, true) - p)) {
+			if(p - first + linkLength > pos.char_) {	// カーソル位置を越えた
+				text = new char_t[linkLength + 1];
+				wcsncpy(text, p, linkLength);
+				text[linkLength] = 0;
+				return true;
+			}
+			p += linkLength;	// 届かない場合は続行
+		} else if(0 != (linkLength = URIDetector::eatMailAddress(p, last, true) - p)) {
+			if(p - first + linkLength > pos.char_) {	// カーソル位置を越えた
+				text = new char_t[linkLength + 7 + 1];
+				wcsncpy(text, L"mailto:", 7);
+				wcsncpy(text + 7, p, linkLength);
+				text[linkLength + 7] = 0;
+				return true;
+			}
+			p += linkLength;	// 届かない場合は続行
+		} else
+			++p;
+	}
+	text = 0;
+	return false;
+}
+
+/**
+ *	表示位置を論理位置に変換する。折り返しをしない場合はそのままの値を返す
+ *	@param displayPosition	変換する表示位置
+ *	@return					変換された論理位置 (特定できなかったメンバは-1)
+ */
+CharPos EditView::logicalCharFromDisplayChar(const CharPos& displayPosition) const {
+	assertValid();
+
+//	if(modeState_.wrapMode == WPM_NONE)
+		return displayPosition;
+/*
+	CharPos			posLogical(0, 0);
+	CLineLayoutInfo*	pInfo = m_pLineLayoutManager->GetLine(0);
+
+	// 行の確定
+	length_t	iTotalDisplayLine = 0;
+	while(true) {
+		iTotalDisplayLine += pInfo->m_vecWrappedOffsets.size() + 1;
+		if(iTotalDisplayLine > posDisplay.iLine)
+			break;
+		pInfo = pInfo->m_pNext;
+		if(pInfo == 0)
+			return CharPos::INVALID_POSITION;
+		++posLogical.iLine;
+	}
+
+	// 文字の確定
+	vector<length_t>::size_type	cOffsets = pInfo->m_vecWrappedOffsets.size();
+	if(cOffsets == 0)	// この行では折り返しは起こっていない
+		return CharPos(posLogical.iLine, posDisplay.iChar);
+	for(vector<length_t>::size_type iOffset = 0; iOffset < cOffsets; ++iOffset) {
+		if(posLogical.iChar + pInfo->m_vecWrappedOffsets[iOffset] >= posDisplay.iChar) {
+			posLogical.iChar += posDisplay.iChar - posLogical.iChar;
+			return posLogical;
+		}
+		posLogical.iChar += pInfo->m_vecWrappedOffsets[iOffset];
+	}
+
+	return CharPos(posLogical.iLine, -1);*/
+}
+
+/**
+ *	キャレットが置けない場所にあるキャレットを正しい位置にずらす。
+ *	UTF-16 サロゲートや複合文字の解決に使う
+ *	@param first, last	文字列
+ *	@param caret		キャレット位置
+ *	@param backward		キャレットをどちらに動かすか
+ *	@return				補正後の位置
+ */
+const char_t* EditView::makeCaretPosValid(const char_t* first, const char_t* last, const char_t* caret, bool backward) {
+	assert(first != 0 && last != 0 && caret >= first && caret <= last && first <= last);
+
+	while(caret != first && caret != last) {
+		if(UTF16Surrogates::isLowSurrogate(*caret)
+				&& caret - first > 0
+				&& UTF16Surrogates::isHighSurrogate(caret[-1]))
+			caret += backward ? -1 : 1;
+		const CodePoint cp =
+			(UTF16Surrogates::isHighSurrogate(*caret) && UTF16Surrogates::isLowSurrogate(caret[1])) ?
+				UTF16Surrogates::decode(caret, 2) : *caret;
+		if(!BoundaryDetector::isGraphemeExtend(cp))
+			break;
+		// ずらす
+		caret += backward ? -1 : 1;
+	}
+	return caret;
+}
+
+/**
+ *	LineLayout::GetCaretPosition から得た位置を文字番号に変換する
+ *	@param line				論理行
+ *	@param x				行の左端からの距離
+ *	@param ignoreExtenders	extender を候補から除外する
+ *	@param truncated		[out] 指定位置に文字が無い場合 true。必要無い場合は null でもよい
+ *	@return					文字位置
+ */
+length_t EditView::mapAbsoluteXToCharacter(length_t line, int x, bool ignoreExtenders, bool* truncated /* = 0 */) const {
+	assert(line < getDocument().getLineCount());
+
+	const LineLayout& layout = sharedData_->layoutManager.getLine(line);
+	const LineLayout::Runs& runs = layout.getRuns();
+	const string_t& s = getDocument().getLine(line);
+	const char_t* const first = s.data();
+	const char_t* const last = first + s.length();
+
+	if(truncated != 0)
+		*truncated = x < 0 || x > layout.getWidth();
+
+	// 最も近い点を探す
+	const char_t* nearestChar = first;						// 今までで最も近い文字
+	ulong minimumDistance = numeric_limits<ulong>::max();	// その距離
+	for(size_t runIndex = 0; runIndex < runs.getCount(); ++runIndex) {
+		const LineLayout::Run& run = runs.getAt(runIndex);
+		const char_t* const nextRun = (runIndex != runs.getCount() - 1) ? first + runs.getAt(runIndex + 1).getIndex() : last;
+		const int runWidth = (run.getWidth() != LineLayout::Run::LINE_WIDTH) ? run.getWidth() : layout.getWidth();
+
+		// ランの外側かチェック
+		const int leftBorder = run.isRightToLeft() ?
+			layout.getCaretPosition(run.getIndex()) - runWidth : layout.getCaretPosition(run.getIndex());
+		const int rightBorder = run.isRightToLeft() ?
+			layout.getCaretPosition(run.getIndex()) : layout.getCaretPosition(run.getIndex()) + runWidth;
+		if(x < leftBorder) {
+			if(static_cast<ulong>(leftBorder - x) < minimumDistance) {
+				nearestChar = !run.isRightToLeft() ? first + run.getIndex() : nextRun - 1;
+				minimumDistance = static_cast<ulong>(Private::dif(layout.getCaretPosition(nearestChar - first), x));
+			}
+			continue;
+		} else if(x > rightBorder) {
+			if(static_cast<ulong>(x - rightBorder) < minimumDistance) {
+				nearestChar = !run.isRightToLeft() ? nextRun - 1 : (first + run.getIndex());
+				minimumDistance = static_cast<ulong>(Private::dif(layout.getCaretPosition(nearestChar - first), x));
+			}
+			continue;
+		}
+
+		// ランの中を走査する
+		for(const char_t* p = first + run.getIndex(); p < ((nextRun != last) ? nextRun : nextRun + 1); ++p) {
+			// 無視する文字
+			if(p != first && p != last) {
+				// 正しい下位サロゲート
+				if(UTF16Surrogates::isLowSurrogate(*p) && UTF16Surrogates::isHighSurrogate(p[-1]))
+					continue;
+				// extender
+				else if(ignoreExtenders) {
+					const CodePoint cp = (p >= last - 1) ? *p : UTF16Surrogates::decode(p, last - p);
+					if(boundaryDetector_->isGraphemeExtend(cp))
+						continue;
+				}
+			}
+
+			const ulong distance = static_cast<ulong>(Private::dif(layout.getCaretPosition(p - first), x));
+
+			// 完全に一致したものがあればそれで確定
+			if(distance == 0)
+				return p - first;
+			// 近いやつを憶えとく
+			else if(distance < minimumDistance) {
+				nearestChar = p;
+				minimumDistance = distance;
+			}
+		}
+	}
+
+	// 最後に行末とも比較
+	return (Private::dif(layout.getCaretPosition(last - first), x) < minimumDistance) ? last - first : nearestChar - first;
+}
+
+/**
+ *	LineLayout::getCaretPosition から得た位置をクライアント x 座標に変換する
+ *	@param x			行の左端からの距離
+ *	@param lineWidth	行の幅
+ *	@return				クライアント x 座標。負値になることもある
+ */
+inline int EditView::mapAbsoluteXToClientX(int x, int lineWidth) const {
+	const int scrollOffset = scrollInfo_.getX() * sharedData_->layoutManager.getAverageCharacterWidth();
+	const int marginWidth = getLayoutSetter().getSettings().leadMargin + getLayoutSetter().getVerticalRulerWidth();
+	if(!getLayoutSetter().getSettings().rightAlign)	// 左寄せ
+		return x + (marginWidth - scrollOffset);
+	else {	// 右寄せ
+		RECT clientRect;
+		getClientRect(clientRect);
+		return (clientRect.right - clientRect.left) - (lineWidth - scrollOffset) + x - marginWidth;
+	}
+}
+
+/**
+ *	クライアント x 座標を LineLayout::getCaretPosition から得られるようなキャレット位置に変換する
+ *	@param x			クライアント座標
+ *	@param lineWidth	行の幅
+ *	@return				行の左端からの位置。負値になることもある
+ */
+int EditView::mapClientXToAbsoluteX(int x, int lineWidth) const {
+	const LineLayoutManager& layoutManager = sharedData_->layoutManager;
+	const LayoutSettings& layout = layoutManager.getSettings();
+	const int marginWidth = layout.leadMargin + layoutManager.getVerticalRulerWidth();
+	const int scrollOffset = scrollInfo_.getX() * layoutManager.getAverageCharacterWidth();
+	if(!layout.rightAlign)
+		return x - marginWidth + scrollOffset;
+	else {
+		RECT clientRect;
+		getClientRect(clientRect);
+		return lineWidth - (clientRect.right - clientRect.left - x - marginWidth) - scrollOffset;
+	}
+}
+
+/// @see AbstractView::onAddedToDocument
+void EditView::onAddedToDocument() {
+}
+
+/// @see LineLayoutManager::IEventListener::onChangedBookmark
+void EditView::onChangedBookmark(length_t line) {
+	invalidateLine(line);
+}
+
+/// @see LineLayoutManager::IEventListener::onChangedLayout
+void EditView::onChangedLayout() {
+	updateScrollInfo(true, true);
+	updateCaretPosition();
+	updateGDIObjects();
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+	updateMemoryDeviceContext();
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+
+	firstVisibleLine_ =
+		originalView_->logicalCharFromDisplayChar(CharPos(scrollInfo_.position.y, 0)).line_;
+	invalidateLines(firstVisibleLine_, -1);
+	onSelectionChanged(selection_->getRange(), selection_->isRectangle(), false, false);
+
+	if(!isFreezed()
+			&& (hasFocus() || getHandle() == EditView::completionWindow_->getSafeHwnd())) {
+		recreateCaret();
+		updateCaretPosition();
+		FOR_EACH_LISTENERS()
+			(*it)->onMoveCaret(selection_->getActivePoint());
+	}
+}
+
+/// @see LineLayoutManager::IEventListener::onChangedMaximumWidthLine
+void EditView::onChangedMaximumWidthLine() {
+	updateScrollInfo(true, false);
+}
+
+/// @see LineLayoutManager::IEventListener::onChangedTextAlignment
+void EditView::onChangedTextAlignment() {
+	const bool rightAlign = sharedData_->layoutManager.getSettings().rightAlign;
+	modifyStyleEx(
+		rightAlign ? WS_EX_RIGHTSCROLLBAR : WS_EX_LEFTSCROLLBAR,
+		rightAlign ? WS_EX_LEFTSCROLLBAR : WS_EX_RIGHTSCROLLBAR);
+	setScrollPos(SB_HORZ, mapInternalXToScrollBoxX(scrollInfo_.position.x));
+}
+
+/// @see LineLayoutManager::IEventListener::onChangedTextDirection
+void EditView::onChangedTextDirection() {
+}
+
+/// @see LineLayoutManager::IEventListener::onChangedVerticalRulerWidth
+void EditView::onChangedVerticalRulerWidth() {
+	invalidateRect(0, false);
+	updateCaretPosition();
+}
+
+/// @see LineLayoutManager::IEventListener::onClearedAllBookmarks
+void EditView::onClearedAllBookmarks() {
+	invalidateLines(0, -1);
+}
+
+/// @see Window::onDestroy
+void EditView::onDestroy() {
+	// メッセージハンドラの実装は EditViewMessageHandlers.cpp に書くべきだが、
+	// MSAA 実装のためにこのファイルで実装する
+
+	// 中途半端なイベントを終わらせる
+	FOR_EACH_CONST_LISTENERS() {
+		(*it)->onChangedAbbreviationExpansionReadyState(false, L"");
+		if(hilightedBracketPositions_[0].line_ != -1)
+			(*it)->onMatchBracketFoundOutOfView(CharPos::INVALID_POSITION);
+	}
+//	ABORT_ISEARCH();
+	if(incrementalSearcher_.isRunning())
+		incrementalSearcher_.abort();
+	endAutoScroll();
+
+	// D&D 解除
+	revokeDragDrop();
+
+	// 従属ウィンドウを削除
+	::DestroyWindow(toolTip_);
+	if(completionWindow_.get() != 0)		completionWindow_->destroyWindow();
+	if(autoScrollOriginMark_.get() != 0)	autoScrollOriginMark_->destroyWindow();
+	
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+	memDC_.selectObject(oldLineBitmap_);
+	::DeleteObject(lineBitmap_);
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+
+#ifndef ASCENSION_NO_ACTIVE_ACCESSIBILITY
+	if(accessibleProxy_ != 0)
+		accessibleProxy_->dispose();
+//	if(accLib.isAvailable())
+//		accLib.notifyWinEvent(EVENT_OBJECT_DESTROY, *this, OBJID_CLIENT, CHILDID_SELF);
+#endif /* !ASCENSION_NO_ACTIVE_ACCESSIBILITY */
+
+	Window::onDestroy();
+}
+
+/// @see LineLayoutManager::IEventListener::onQueryDeviceContext
+ClientDC EditView::onQueryDeviceContext() {
+	return getDC();
+}
+
+/// @see AbstractView::onResetDocument
+void EditView::onResetDocument() {
+//	freezeInfo_.count = 0;
+//	freeze();
+	if(this == originalView_) {
+		sharedData_->layoutManager.freeze();
+		sharedData_->layoutManager.resetConfigurations();
+		sharedData_->layoutManager.deleteAllLines();
+		sharedData_->layoutManager.insertLines(0, 0);
+		sharedData_->layoutManager.unfreeze();
+	}
+	setTextDirection(false);
+	FOR_EACH_LISTENERS()
+		(*it)->onLoadFile();
+	updateScrollInfo(true, true);
+	updateCaretPosition();
+	invalidateRect(0, false);
+//	unfreeze();
+}
+
+/**
+ *	選択が変更されたときに Selection インスタンスから呼び出される
+ *	@param oldRange				移動前の範囲
+ *	@param wasRectangle			変更前に矩形だった場合 true
+ *	@param reveal				選択が可視になるようにスクロール
+ *	@param forDocumentUpdate	ドキュメントの更新による場合 true
+ */
+void EditView::onSelectionChanged(const TextRange& oldRange, bool wasRectangle, bool reveal, bool forDocumentUpdate) {
+	if(!isWindowVisible())
+		return;
+	const TextRange newRange = selection_->getRange();
+	bool changed = false;
+
+	// キャレットの調整
+	if(!isFreezed() && (hasFocus() || completionWindow_->hasFocus())) {
+		if(isOvertypeMode())
+			recreateCaret();
+		else
+			updateCaretPosition();
+	}
+
+	// 選択の強調表示の再描画
+	if(wasRectangle || selection_->isRectangle()) {
+		invalidateLines(
+			min(oldRange.getTop(), newRange.getTop()).line_,
+			max(oldRange.getBottom(), newRange.getBottom()).line_);
+		changed = true;
+	} else if(newRange != oldRange) {	// 本当に範囲が変化した
+		if(oldRange.isEmpty()) {	// 元々選択が空だった場合
+			if(!selection_->isEmpty()) {	// 選択を作成した
+				if(sharedData_->options.appearance[SHOW_CURRENT_UNDERLINE]
+						&& (oldRange.pos1_.line_ < newRange.getTop().line_
+						|| oldRange.pos1_.line_ > newRange.getBottom().line_)) {
+					invalidateLine(oldRange.pos1_.line_);
+					if(!isFreezed()) updateWindow();
+				}
+				invalidateLines(newRange.getTop().line_, newRange.getBottom().line_);
+			} else if(oldRange.getBottom().line_ != newRange.getBottom().line_	// 本当は表示行に変換する必要がある...
+					&& sharedData_->options.appearance[SHOW_CURRENT_UNDERLINE]) {
+				// 2行が隣り合っている場合は1回にまとめる
+				if(Private::dif(newRange.pos1_.line_, oldRange.pos1_.line_) == 1)
+					invalidateLines(newRange.pos1_.line_, oldRange.pos1_.line_);
+				else {
+					invalidateLine(newRange.pos1_.line_);
+					if(!isFreezed()) updateWindow();
+					invalidateLine(oldRange.pos1_.line_);
+				}
+			}
+		} else {	// 元々選択があった場合
+			if(newRange.isEmpty()) {	// 選択を解除した
+				invalidateLines(oldRange.getTop().line_, oldRange.getBottom().line_);
+				if(!isFreezed()) updateWindow();
+				if(sharedData_->options.appearance[SHOW_CURRENT_UNDERLINE]
+						&& (newRange.pos1_.line_ < oldRange.getTop().line_
+						|| newRange.pos1_.line_ > oldRange.getBottom().line_))
+					invalidateLine(newRange.pos1_.line_);
+			} else if(oldRange.getTop() == newRange.getTop())	// 始点固定
+				invalidateLines(oldRange.getBottom().line_, newRange.getBottom().line_);
+			else if(oldRange.getBottom() == newRange.getBottom())	// 終点固定
+				invalidateLines(oldRange.getTop().line_, newRange.getTop().line_);
+			else {	// いずれも変化
+				if((oldRange.getTop().line_ >= newRange.getTop().line_
+						&& oldRange.getTop().line_ <= newRange.getBottom().line_)
+						|| (oldRange.getBottom().line_ >= newRange.getTop().line_
+						&& oldRange.getBottom().line_ <= newRange.getBottom().line_))
+					invalidateLines(
+						min(oldRange.getTop().line_, newRange.getTop().line_),
+						max(oldRange.getBottom().line_, newRange.getBottom().line_));
+				else {
+					invalidateLines(oldRange.getTop().line_, oldRange.getBottom().line_);
+					if(!isFreezed()) updateWindow();
+					invalidateLines(newRange.getTop().line_, newRange.getBottom().line_);
+				}
+			}
+		}
+		changed = true;
+	}
+
+	if(changed) {
+		// 短縮語の展開待ち状態を終了
+		if(modeState_.readyToExpandAbbrev) {
+			modeState_.readyToExpandAbbrev = false;
+			FOR_EACH_LISTENERS()
+				(*it)->onChangedAbbreviationExpansionReadyState(false, L"");
+		}
+
+		// 補完を中止
+		if(completionWindow_->isWindowVisible()) {
+			const EditPoint& caret = selection_->getActivePoint();
+			const TextRange completionContext = completionWindow_->getContextRange();
+			if(caret < completionContext.getTop() || caret > completionContext.getBottom())
+				closeCompletionWindow();
+		}
+		
+		// イベントリスナに通知
+		if(!isFreezed()) {
+			FOR_EACH_LISTENERS()
+				(*it)->onMoveCaret(selection_->getActivePoint());
+		}
+	}
+
+	if(reveal) {	// 選択が可視になるようにスクロール
+		if(!isFreezed())
+			updateWindow();	// これが無いと駄目らしい...
+		selection_->getActivePoint().reveal(*this);
+	}
+	if(changed /*&& !forDocumentUpdate*/)	// 対括弧の強調表示
+		checkMatchBrackets();
+	if(imeCompositionActivated_)	// IME で入力中の場合は編集ウィンドウの位置を修正
+		updateIMECompositionWindowPosition();
+}
+
+/**
+ *	ドキュメントの変更を受け取る
+ *	@param update	更新内容
+ *	@see			BaseView::onUpdate
+ */
+void EditView::onUpdate(const DocumentUpdate& update) {
+	const bool focused = hasFocus();
+	length_t modifiedLineCount = 0;	// 変更の影響を受けた行数
+	LineLayoutManager& layout = sharedData_->layoutManager;
+
+	// インクリメンタル検索中であればやめさせる
+	if(incrementalSearcher_.isRunning()
+			&& (update.summary == DocumentUpdate::INSERT_OPERATION || update.summary == DocumentUpdate::DELETE_OPERATION))
+		incrementalSearcher_.abort();
+
+	if(update.summary == DocumentUpdate::INSERT_OPERATION && this == originalView_) {	// 挿入操作
+		if(update.first.line_ == update.last.line_) {	// 改行が含まれていない
+			if(layout.getLineParseStage(update.last.line_) >= LineLayout::PARSE_STAGE_MULTILINE_ANNOTATIONS)
+				modifiedLineCount = layout.modifyLine(update.last.line_);
+			if(modifiedLineCount != 0) {
+				FOR_EACH_LISTENERS()
+					(*it)->onLineOperationEvent(IEditViewEventListener::LOE_MODIFIED, update.last.line_, modifiedLineCount);
+			}
+		} else {	// 複数行
+			layout.insertLines(update.first.line_ + 1, update.last.line_);
+			if(layout.getLineParseStage(update.first.line_) >= LineLayout::PARSE_STAGE_MULTILINE_ANNOTATIONS)
+				modifiedLineCount = layout.modifyLine(update.first.line_);
+			updateScrollInfo(false, true);
+			FOR_EACH_LISTENERS() {
+				if(modifiedLineCount != 0)
+					(*it)->onLineOperationEvent(IEditViewEventListener::LOE_MODIFIED, update.first.line_, modifiedLineCount);
+				(*it)->onLineOperationEvent(IEditViewEventListener::LOE_CREATED,
+					update.first.line_ + 1, update.last.line_ - update.first.line_);
+			}
+			if(scrollInfo_.position.y * scrollInfo_.verticalRatio > update.first.line_)
+				setScrollPos(SB_VERT,
+					scrollInfo_.position.y += static_cast<long>(update.last.line_ - update.first.line_) / scrollInfo_.verticalRatio,
+					!isFreezed());
+			if(isFreezed()) {	// 凍結中の描画待ち行とスクロール位置をずらす
+				for(set<length_t>::iterator it = freezeInfo_.invalidLines.begin(); it != freezeInfo_.invalidLines.end(); ++it) {
+					if(*it >= update.first.line_)
+						*it += update.last.line_ - update.first.line_;
+				}
+				if(freezeInfo_.scrollPosition.y != -1
+						&& static_cast<ulong>(freezeInfo_.scrollPosition.y) >= update.first.line_)
+					freezeInfo_.scrollPosition.y += static_cast<long>(update.last.line_ - update.first.line_);
+			}
+			modifiedLineCount = getVisibleLineCount() /*- (update.first.line_ - scrollInfo_.position.y) + 1*/;
+		}
+	} else if(update.summary == DocumentUpdate::DELETE_OPERATION && this == originalView_) {	// 削除操作
+		if(update.first.line_ == update.last.line_) {	// 改行が含まれていない
+			if(layout.getLineParseStage(update.last.line_) >= LineLayout::PARSE_STAGE_MULTILINE_ANNOTATIONS)
+				modifiedLineCount = layout.modifyLine(update.last.line_);
+			if(modifiedLineCount != 0) {
+				FOR_EACH_LISTENERS()
+					(*it)->onLineOperationEvent(IEditViewEventListener::LOE_MODIFIED, update.last.line_, modifiedLineCount);
+			}
+		} else {	// 複数行
+			layout.deleteLines(update.first.line_ + 1, update.last.line_);
+			if(layout.getLineParseStage(update.first.line_) >= LineLayout::PARSE_STAGE_MULTILINE_ANNOTATIONS)
+				modifiedLineCount = layout.modifyLine(update.first.line_);
+			updateScrollInfo(false, true);
+			FOR_EACH_LISTENERS() {
+				if(modifiedLineCount != 0)
+					(*it)->onLineOperationEvent(IEditViewEventListener::LOE_MODIFIED, update.first.line_, modifiedLineCount);
+				(*it)->onLineOperationEvent(IEditViewEventListener::LOE_DELETED,
+					update.first.line_ + 1, update.last.line_ - update.first.line_);
+			}
+			if(isFreezed()) {	// 凍結中の描画待ち行とスクロール位置をずらす
+				set<length_t>::iterator it = freezeInfo_.invalidLines.begin();
+				while(it != freezeInfo_.invalidLines.end()) {
+					if(*it > update.first.line_ && *it <= update.last.line_)
+						it = freezeInfo_.invalidLines.erase(it);
+					else {
+						if(*it >= update.last.line_)
+							*it -= update.last.line_ - update.first.line_;
+						++it;
+					}
+				}
+				if(freezeInfo_.scrollPosition.y != -1) {
+					if(static_cast<ulong>(freezeInfo_.scrollPosition.y) > update.first.line_
+							&& static_cast<ulong>(freezeInfo_.scrollPosition.y) <= update.last.line_)
+						freezeInfo_.scrollPosition.y = static_cast<long>(update.first.line_);
+					else if(static_cast<ulong>(freezeInfo_.scrollPosition.y) >= update.last.line_) {
+						freezeInfo_.scrollPosition.y -= static_cast<long>(update.last.line_ - update.first.line_);
+						freezeInfo_.scrollPosition.y = max<long>(0, freezeInfo_.scrollPosition.y);
+					}
+				}
+			}
+/*			if(focused && !isFreezed()) {
+				anchorPoint_->moveToPoint(update.result);
+				activePoint_->moveToPoint(update.result);
+				onMoveCaret();
+			}
+*/			modifiedLineCount = getVisibleLineCount() /*- (update.first.line_ - scrollInfo_.position.y) + 1*/;
+		}
+	} else if(update.summary == DocumentUpdate::SAVED) {	// ドキュメントの保存
+		invalidateRect(0, false);
+		return;
+	} else if(update.summary == DocumentUpdate::BEGIN_UNDO_OPERATION) {
+		freeze();
+		return;
+	} else if(update.summary == DocumentUpdate::END_UNDO_OPERATION) {
+		unfreeze();
+		if(update.result != CharPos::INVALID_POSITION) {
+			if(focused)
+				getSelection().moveTo(update.result, true);
+			checkMatchBrackets();
+		}
+		closeCompletionWindow();
+		return;
+	} else if(update.summary == DocumentUpdate::CHANGED_NARROWING) {
+		if(getDocument().isNarrowed()) {
+			onHScroll(SB_SETPOS, mapInternalXToScrollBoxX(scrollInfo_.position.x), 0);
+			onVScroll(SB_SETPOS, scrollInfo_.position.y, 0);
+		}
+		checkMatchBrackets();
+		invalidateRect(0, false);
+		return;
+	} else
+		return;
+
+    if(update.first.line_ < firstVisibleLine_)	// 先頭可視行の更新
+		firstVisibleLine_ = logicalCharFromDisplayChar(CharPos(scrollInfo_.position.y, 0)).line_;
+
+/*	if(originalView_ != this) {
+		invalidateLine(selection_->getAnchorPoint().line_);
+		if(selection_->getAnchorPoint().getLineNumber() != selection_->getActivePoint().getLineNumber()) {
+			updateWindow();
+			invalidateLine(selection_->getActivePoint().getLineNumber());
+		}
+	}
+*/	if((focused || EditView::completionWindow_->hasFocus()) && !isFreezed())
+/*		getSelection().moveTo(update.result, true)*/;
+	else if(!isFreezed())
+		onSelectionChanged(selection_->getRange(), selection_->isRectangle(), false, false);
+
+//	recalcLeftTabWidth();
+	if(originalView_ == this) {
+		if(modifiedLineCount == 1) {
+			invalidateLine(update.first.line_);
+//			if(!isFreezed())
+//				updateWindow();	// 行数が多いときはこっちの方が速いみたい
+			for(set<EditView*>::iterator it = clones_->begin(); it != clones_->end(); ++it) {
+				(*it)->invalidateLine(update.first.line_);
+//				(*it)->updateWindow();
+			}
+		} else {
+			invalidateLines(update.first.line_, -1);
+			for(set<EditView*>::iterator it = clones_->begin(); it != clones_->end(); ++it)
+				(*it)->invalidateLines(update.first.line_, -1);
+		}
+	}
+}
+
+/// 補完ウィンドウを開き、補完モードに入る
+void EditView::openCompletionWindow() {
+	if(!selection_->isEmpty()) {	// 選択がある場合は解除するだけ
+		getSelection().moveTo(static_cast<CharPos>(selection_->getActivePoint()), true);
+		return;
+	} else if(getDocument().isReadOnly())
+		return;
+
+	// <<実験的な動作>>
+	// 周辺の行から識別子を収集してみる
+	set<string_t> candidateWords;
+	const length_t RECOG_LINES = 100;	// 直前の何行を考慮するか
+	for(length_t i = (selection_->getActivePoint().getLineNumber() > RECOG_LINES) ?
+			selection_->getActivePoint().getLineNumber() - RECOG_LINES : 0;
+			i < selection_->getActivePoint().getLineNumber(); ++i) {
+		const Tokens& tokens = sharedData_->layoutManager.getLine(i).getTokens();
+		const string_t& line = getDocument().getLine(i);
+		for(size_t j = 0; j < tokens.count; ++j) {
+			const Token& token = tokens.array[j];
+			if(token.getType() == Token::IDENTIFIER) {
+				if(j < tokens.count - 1)
+					candidateWords.insert(line.substr(token.getIndex(),
+						tokens.array[j + 1].getIndex() - token.getIndex()));
+				else /* if(j == tokens.count - j) */ {
+					candidateWords.insert(line.substr(token.getIndex()));
+					break;
+				}
+			}
+		}
+	}
+	// キーワードからも収集 -> やーめた
+/*	const KeywordsMap& keywords = getLexer().getKeywords();
+	for(KeywordsMap::const_iterator it = keywords.begin(); it != keywords.end(); ++it) {
+		for(KeywordSet::const_iterator word = it->second.begin(); word != it->second.end(); ++word)
+			candidateWords.insert(*word);
+	}
+*/
+	// 候補が1つも無ければ終了
+	if(candidateWords.empty()) {
+		beep();
+		return;
+	}
+
+	// 開始
+	completionWindow_->start(candidateWords);
+
+	if(completionWindow_->updateListCursel())	// 候補が絞られた -> 候補ウィンドウを出さずに補完
+		completionWindow_->complete();
+	else {
+		// 位置決め (まだ不完全)
+		POINT caretPoint;	// キャレット位置
+		Rect clientRect;	// クライアント矩形
+		RECT listRect;		// 補完ウィンドウの矩形
+
+		getClientRect(clientRect);
+		::GetCaretPos(&caretPoint);
+
+		const int idealWidth = 170;
+		const int idealHeight = clientRect.getHeight() / 3;
+
+		// 水平位置と幅
+		if(!isTextDirectionRightToLeft()) {	// LTR
+			listRect.left = caretPoint.x;
+			listRect.right = listRect.left + idealWidth;
+			if(listRect.right > clientRect.right) {
+				listRect.left = max(listRect.left - (listRect.right - clientRect.right), clientRect.left);
+				listRect.right = clientRect.right;
+			}
+		} else {	// RTL
+		}
+
+		// 垂直位置と高さ
+		if(clientRect.bottom - (caretPoint.y + sharedData_->layoutManager.getLineHeight()) >= idealHeight) {	// キャレットの下に表示
+			listRect.top = caretPoint.y + sharedData_->layoutManager.getLineHeight();
+			listRect.bottom = listRect.top + idealHeight;
+		} else if(caretPoint.y - clientRect.top >= idealHeight) {	// キャレットの上に表示
+			listRect.top = caretPoint.y - idealHeight;
+			listRect.bottom = caretPoint.y;
+		} else if(clientRect.bottom - (caretPoint.y + sharedData_->layoutManager.getLineHeight()) >= caretPoint.y - clientRect.top) {
+			listRect.top = caretPoint.y + sharedData_->layoutManager.getLineHeight();
+			listRect.bottom = clientRect.bottom;
+		} else {
+			listRect.top = clientRect.top;
+			listRect.bottom = caretPoint.y;
+		}
+
+		completionWindow_->moveWindow(listRect, false);
+		completionWindow_->setFont(
+			sharedData_->options.appearance[USE_EDITOR_FONT_FOR_COMPLETION] ?
+				sharedData_->layoutManager.getRegularFont() : 0);
+		completionWindow_->showWindow(SW_SHOW);
+	}
+}
+
+/**
+ *	指定位置のクライアント座標を取得
+ *	@param pos	論理位置
+ *	@return		クライアント座標
+ */
+POINT EditView::posFromChar(const CharPos& pos) const {
+	assertValidAsWindow();
+	POINT						pt;	// 戻り値
+	const length_t				line = min(pos.line_, getDocument().getLineCount() - 1);
+	const LineLayout&			lineLayout = sharedData_->layoutManager.getLine(line);
+	const LineLayoutManager&	layoutManager = sharedData_->layoutManager;
+	const LayoutSettings&		layout = getLayoutSetter().getSettings();
+	length_t					start = 0;
+
+	// 折り返しを考慮する場合
+	if(layout.wrapMode != WPM_NONE) {
+		const CharPos					displayPos = displayCharFromLogicalChar(pos);
+		const LineLayout::WrapOffsets*	wrapOffsets = lineLayout.getWrapPoints();
+		assert(wrapOffsets != 0);
+
+		// y 座標の確定
+		pt.y = layout.topMargin
+				+ layoutManager.getLineHeight() * static_cast<long>(displayPos.line_ - scrollInfo_.getY());
+		if(wrapOffsets->count != 0) {
+			vector<length_t>::size_type	i;
+			for(i = 0; i < wrapOffsets->count && pos.char_ > wrapOffsets->array[i]; ++i)
+				pt.y += layoutManager.getLineHeight();
+			if(i == wrapOffsets->count)
+				--i;
+			start = (i != 0) ? wrapOffsets->array[i - 1] : 0;
+		}
+		// x 座標の確定
+
+	} else {
+		// y 座標の確定
+		pt.y = layout.topMargin + layoutManager.getLineHeight() * static_cast<long>(line - scrollInfo_.getY());
+
+		// x 座標の確定
+		pt.x = mapAbsoluteXToClientX(
+			lineLayout.getCaretPosition(min(pos.char_, getDocument().getLineLength(line))),
+			lineLayout.getWidth());
+	}
+
+	return pt;
+}
+
+/// @see IDropSource::QueryContinueDrag
+STDMETHODIMP EditView::QueryContinueDrag(BOOL fEscapePressed, DWORD grfKeyState) {
+	assertValid();
+
+	if(fEscapePressed || toBoolean(grfKeyState & MK_RBUTTON))	// キャンセル
+		return DRAGDROP_S_CANCEL;
+	if(!toBoolean(grfKeyState & MK_LBUTTON))	// ドロップ
+		return DRAGDROP_S_DROP;
+	return S_OK;
+}
+
+/**
+ *	リンクテキスト上にカーソルが移動したときにポップアップするテキストを返す
+ *	@param uri	リンクの URI
+ *	@return		テキスト。空文字列だとポップアップは表示されない
+ */
+string_t EditView::queryInvokableLinkMessage(const string_t& uri) {
+	return L"";
+}
+
+/**
+ *	行描画前に前景色と背景色を問い合わせる
+ *	@param line				論理行
+ *	@param fgColor, bgColor	[out] 統一前景色と背景色。-1を返すと通常通り色分けされる (呼び出し時には-1がセットされている)
+ */
+void EditView::queryLineColors(length_t line, COLORREF& fgColor, COLORREF& bgColor) {
+}
+
+/**
+ *	@brief ビューの設定情報からキャレットを作成し直す
+ *
+ *	ビューがフォーカスを持っていなければ何もしない。作成されたキャレットは自動的に表示される
+ */
+void EditView::recreateCaret() {
+	assertValidAsWindow();
+
+	if(!hasFocus())
+		return;
+
+	const LineLayoutManager& layoutManager = sharedData_->layoutManager;
+	const ushort charHeight = layoutManager.getLineHeight() - getLayoutSetter().getSettings().lineSpan;
+	const bool overtype = modeState_.overtype && selection_->isEmpty();
+	
+	::DestroyCaret();
+	::DeleteObject(sharedData_->gdiObjects.caretBitmap);
+	sharedData_->gdiObjects.caretBitmap = 0;
+
+	if(!overtype)
+		sharedData_->caretWidth = sharedData_->options.appearance[THIN_CARET] ? 1 : 2;
+	else {	// 上書きモードのときはキャレットを次の文字と同じ幅にする
+		const string_t&	line = getDocument().getLine(selection_->getActivePoint().getLineNumber());
+
+		if(selection_->getActivePoint().isEndOfLine())	// 行末
+			sharedData_->caretWidth = layoutManager.getAverageCharacterWidth();
+		else if(line[selection_->getActivePoint().getCharNumber()] == L'\t') {	// 水平タブ
+			// このタブを含むランの方向を調べる
+			const length_t i = selection_->getActivePoint().getCharNumber();
+			const LineLayout& lineLayout = layoutManager.getLine(selection_->getActivePoint().getLineNumber());
+			const LineLayout::Runs& runs = lineLayout.getRuns();
+			bool ltr;
+			for(size_t run = 0; run < runs.getCount(); ++run) {
+				if(i >= runs.getAt(run).getIndex()
+						&& i < ((run < runs.getCount() - 1) ? runs.getAt(run + 1).getIndex() : line.length())) {
+					ltr = !runs.getAt(run).isRightToLeft();
+					break;
+				}
+			}
+
+			// 次のタブ位置
+			const ulong x = lineLayout.getCaretPosition(i);
+			sharedData_->caretWidth = static_cast<int>(Private::dif(x, layoutManager.getNextTabStop(x, ltr)));
+		} else {
+			DC& dc = getDC();
+			HFONT oldFont = dc.selectObject(layoutManager.getRegularFont());
+			const CharPos pos = boundaryDetector_->searchGraphemeBase(selection_->getActivePoint(), true);
+
+			sharedData_->caretWidth = dc.getTextExtent(
+				line.data() + selection_->getActivePoint().getCharNumber(),
+				static_cast<int>(pos.char_ - selection_->getActivePoint().getCharNumber())).cx;
+			dc.selectObject(oldFont);
+		}
+	}
+
+	if(sharedData_->options.appearance[LOCALE_SPECIFIC_CARET_SHAPE]) {
+		HIMC imc = ::ImmGetContext(getHandle());
+		const bool imeOpened = toBoolean(::ImmGetOpenStatus(imc));
+
+		::ImmReleaseContext(getHandle(), imc);
+		if(imeOpened) {	// CJK and IME is open
+			const RGBQUAD red = {0xFF, 0xFF, 0x80, 0x00};
+			sharedData_->gdiObjects.caretBitmap =
+				createSolidCaretBitmap(sharedData_->caretWidth, charHeight, red);
+		} else if(!overtype && charHeight > 3) {
+			const RGBQUAD black = {0xFF, 0xFF, 0xFF, 0x00};
+			const WORD langID = PRIMARYLANGID(LOWORD(::GetKeyboardLayout(::GetCurrentThreadId())));
+
+			if(isRTLLanguage(langID))	// RTL
+				sharedData_->gdiObjects.caretBitmap =
+					createRTLCaretBitmap(charHeight, sharedData_->options.appearance[THIN_CARET], black);
+			else if(isTISLanguage(langID))	// Thai relations
+				sharedData_->gdiObjects.caretBitmap =
+					createTISCaretBitmap(charHeight, sharedData_->options.appearance[THIN_CARET], black);
+		}
+	}
+
+	if(sharedData_->gdiObjects.caretBitmap == 0)
+		createSolidCaret(sharedData_->caretWidth, charHeight);
+	else
+		createCaret(sharedData_->gdiObjects.caretBitmap, 0, 0);
+	showCaret();
+	updateCaretPosition();
+}
+
+/**
+ *	@brief クリップボードのコードページの設定
+ *
+ *	Ascension はクリップボードの形式として、UTF-16 表現である @c CF_UNICODETEXT
+ *	の使用を想定している。しかしクリップボードのデータを参照する際に @c CF_UNICODETEXT
+ *	形式のデータが無ければネイティブエンコードの @c CF_TEXT を代わりに参照する。
+ *	あるいはデータを書き込むときに @c CF_UNICODETEXT だけでなく、@c CF_TEXT 形式のデータも同時に書き込む。
+ *	この @c CF_TEXT 形式のテキストのエンコードは、通常はシステムの既定のネイティブコードを使用するが、
+ *	このメソッドによってそのエンコードを上書きすることができる
+ *	@param cp						コードページ
+ *	@throw std::invalid_argument	@a cp が不正なときスロー
+ *	@see							EditView::getClipboardNativeCodePage
+ */
+void EditView::setClipboardNativeCodePage(Encodings::CodePage cp) {
+	// TODO: 未実装
+}
+
+/**
+ *	次に入力する文字の変換を設定する
+ *	@param variation 変換の種類
+ */
+void EditView::setNextCharacterVariation(NextCharVariation variation) {
+	assertValid();
+	nextCharVariation_ = variation;
+}
+
+/**
+ *	その他の設定
+ *	@param options 設定情報
+ */
+void EditView::setOptions(const Options& options) {
+	assertValid();
+
+	const LineLayout::ParseStage parseStage = LineLayout::PARSE_STAGE_UNPARSED;
+
+	sharedData_->options = options;
+
+	if(parseStage >= LineLayout::PARSE_STAGE_TOKENS)
+		sharedData_->layoutManager.invalidate(parseStage);
+	FOR_EACH_CLONES() {
+		if(it->isWindow()) {
+			if(it->hasFocus())
+				it->recreateCaret();
+			it->invalidateRect(0, false);
+		}
+	}
+}
+
+/**
+ *	上書きモードの設定
+ *	@param overtype true: 上書き、false: 挿入
+ */
+void EditView::setOvertypeMode(bool overtype /* = true */) {
+	assertValid();
+
+	modeState_.overtype = overtype;
+	recreateCaret();
+	if(isWindow())
+		setFocus();
+	FOR_EACH_LISTENERS()
+		(*it)->onChangedOvertypeMode();
+}
+
+/**
+ *	@brief テキストの方向の設定
+ *
+ *	このメソッドはテキストの方向だけでなく、以下についても設定を行う
+ *	<ul>
+ *		<li>テキストの位置 : LTR の場合は左寄せ、RTL の場合は右寄せ</li>
+ *		<li>垂直スクロールバーの位置 : LTR の場合は右、RTL の場合は左</li>
+ *	</ul>
+ *	@see EditView::isTextDirectionRightToLeft
+ */
+void EditView::setTextDirection(bool rightToLeft) {
+	if(sharedData_->layoutManager.isRTLSupported()) {
+		LayoutSettings settings = sharedData_->layoutManager.getSettings();
+		settings.rightToLeftReading = rightToLeft;
+		settings.rightAlign = rightToLeft;
+		sharedData_->layoutManager.setSettings(settings);
+	}
+}
+
+/**
+ *	カーソル位置にツールチップを表示
+ *	@param text					表示するテキスト。CR+LF で改行。NUL は含められない
+ *	@param timeToWait			表示されるまでの時間 (ミリ秒)。-1だとシステム既定
+ *	@param timeRemainsVisible	表示し続ける時間 (ミリ秒)。-1だとシステム既定
+ */
+void EditView::showToolTip(const string_t& text, ulong timeToWait /* = -1 */, ulong timeRemainsVisible /* = -1 */) {
+	assertValidAsWindow();
+
+	delete[] tipText_;
+	tipText_ = new wchar_t[text.length() + 1];
+	hideToolTip();
+	if(timeToWait == -1)
+		timeToWait = ::GetDoubleClickTime();
+	wcscpy(tipText_, text.c_str());
+	setTimer(TIMERID_CALLTIP, timeToWait, 0);
+}
+
+#if 0
+/**
+ *	@brief 現在キャレットのある行をスマートインデントする
+ *
+ *	<strong>未実装。使用禁止</strong>
+ *
+ *	このメソッドは @a ch の挿入も行い (実際にスマートインデントが発動したときのみ)、
+ *	そのときには全体の操作が OCF_PREVENTALL となるように処理する。
+ *	現在このメソッドは一部の言語でしか意味が無い。
+ *	他の言語を追加するにはポリシークラスか何かを作る必要がある。
+ *	スマートインデントの挙動は めも.txt にまとめてある
+ *	@param ch	スマートインデントを実行する入力文字 (改行は L'\n' を使う)
+ *	@return		スマートインデントを行ったかどうか
+ */
+bool EditView::smartIndent(wchar_t ch) {
+/*	assertValidAsWindow();
+
+	ulong	nNest = 1;	// 括弧のネストレベル
+
+	if(ch == L'{' || ch == L'}') {	// '{' を探す
+		if(m_posActive.iLine == 0)
+			return false;
+		if(-1 == FindBrace(m_posActive.iLine, L'{', nNest, m_posActive.iChar - 1)) {	// 現在行を探す
+			for(length_t iLine = m_posActive.iLine - 1;	// 行を遡って探す
+					m_posActive.iLine - iLine < m_modeState.cFindLimit; --iLine) {
+				if(-1 != FindBrace(iLine, L'{', nNest))
+					break;
+				if(iLine == 0)
+					break;
+			}
+			CEditDoc*		pDoc = getDocument();
+			const string_t&	strLine = pDoc->GetLine(iLine);
+			length_t		cchIndent = IsWhiteSpace(strLine.data(), strLine.length(), true);
+			string_t		strIndent = strLine.substr(0, cchIndent);
+
+			strLine = pDoc->GetLine(m_posActive.iLine);
+			length_t	cchIndentOld = IsWhiteSpace(strLine.data(), strLine.length(), true);
+			if(ch == L'{') {
+				strIndent.insert(0, L'\t');
+				cchIndent += 1;
+			}
+			if(cchIndentOld != 0)
+				pDoc->DeleteText(this,
+					CharPos(m_posActive.iLine, 0), CharPos(m_posActive.iLine, cchIndentOld),
+					static_cast<OperationConcatenationFlag>(OCF_PREVENTCONCATFORWARD | OCF_CONCATBACKWARD));
+			pDoc->InsertText(this, CharPos(m_posActive.iLine, 0), strIndent,
+				(cchIndentOld != 0) ? OCF_CONCATALL
+				: static_cast<OperationConcatenationFlag>(OCF_PREVENTCONCATFORWARD | OCF_CONCATBACKWARD));
+			SetSelWithoutSelection(m_posActive.iLine, m_posActive.iChar + cchIndent - cchIndentOld);
+			InsertText(string_t(&ch, 1),
+				static_cast<OperationConcatenationFlag>(OCF_CONCATFORWARD | OCF_PREVENTCONCATBACKWARD));
+			return true;
+		}
+	} else if(ch == L'\n') {	// 前の行を調べる
+		const string_t&	strPrevLine = getDocument()->GetLine(m_posActive.iLine).substr(0, m_posActive.iChar);
+		length_t		cchPrevLine = strPrevLine.length();
+		const char_t*	pwszPrevLine = strPrevLine.c_str();
+		length_t		iChar = 0;					// 現在位置
+		MCommentType	mct = m_pLineLayoutManager->FindByLineNumber(m_posActive.iLine)->m_mctFromPrev;
+		bool			bMCommentContinued = mct != MCT_NOTCOMMENT;
+		ulong			nBraceLevel = 0;			// 中括弧の入れ子レベル
+		ulong			nParenLevel = 0;			// 丸括弧の入れ子レベル
+		bool			bLastIsSemicolon = false;	// 最後に調べた文字がセミコロンか
+		length_t		cchToken;					// 見つかったトークンの長さ
+		
+		// 括弧が閉じられているか、最後の文字が何かを調べる
+		while(iChar < cchPrevLine) {
+			if(iChar == 0 && mct == MCT_1) {
+				cchToken = IsMComment1(pwszPrevLine, cchPrevLine, bMCommentContinued);
+				if(bMCommentContinued)
+					break;
+				bLastIsSemicolon = false;
+				iChar += cchToken;
+			} else if(iChar == 0 && mct == MCT_2) {
+				cchToken = IsMComment2(pwszPrevLine, cchPrevLine, bMCommentContinued);
+				if(bMCommentContinued)
+					break;
+				bLastIsSemicolon = false;
+				iChar += cchToken;
+			} else if(0 != IsSComment1(pwszPrevLine + iChar) || 0 != IsSComment2(pwszPrevLine + iChar))
+				break;
+			else if(0 != (cchToken = IsMComment1(pwszPrevLine + iChar, cchPrevLine - iChar, bMCommentContinued))
+					|| 0 != (cchToken = IsMComment2(pwszPrevLine + iChar, cchPrevLine - iChar, bMCommentContinued))) {
+				if(bMCommentContinued)
+					break;
+				iChar += cchToken;
+				bLastIsSemicolon = false;
+			} else if(0 != (cchToken = IsSingleQuotation(pwszPrevLine + iChar, cchPrevLine - iChar))
+					|| 0 != (cchToken = IsDoubleQuotation(pwszPrevLine + iChar, cchPrevLine - iChar))) {
+				iChar += cchToken;
+				bLastIsSemicolon = false;
+			} else if(0 != (cchToken = IsWhiteSpace(pwszPrevLine + iChar, cchPrevLine - iChar, true)))
+				iChar += cchToken;
+			else {	// その他の文字
+				wchar_t	wch = *(pwszPrevLine + iChar);
+				if(wch == L';')
+					bLastIsSemicolon = true;
+				else {
+					bLastIsSemicolon = false;
+					if(wch == L'{')								++nBraceLevel;
+					else if(wch == L'(')						++nParenLevel;
+					else if(wch == L'}' && nBraceLevel != 0)	--nBraceLevel;
+					else if(wch == L')' && nParenLevel != 0)	--nParenLevel;
+				}
+				++iChar;
+			}
+		}
+
+		// スマートインデントするか?
+		length_t	cchIndentOld = IsWhiteSpace(strPrevLine.c_str(), cchPrevLine, true);
+		if((nBraceLevel != 0 || nParenLevel != 0)
+				|| (!bLastIsSemicolon && cchIndentOld != 0)) {
+			ReplaceSel(CEditDoc::m_arrBreakStrings[getDocument()->GetBreakType()],
+				static_cast<OperationConcatenationFlag>(OCF_PREVENTCONCATFORWARD | OCF_CONCATBACKWARD));
+
+			length_t		iCharOrg = m_posActive.iChar;
+			CEditDoc*		pDoc = getDocument();
+			const string_t&	strCurrentLine = pDoc->GetLine(m_posActive.iLine);
+			length_t		cchIndent = IsWhiteSpace(strCurrentLine.c_str(), strCurrentLine.length(), true);
+			string_t		strIndent = L"\t" + strPrevLine.substr(0, cchIndentOld);
+
+			pDoc->DeleteText(this, m_posActive, CharPos(m_posActive.iLine, cchIndent), OCF_CONCATALL);
+			InsertText(strIndent,
+				static_cast<OperationConcatenationFlag>(OCF_CONCATFORWARD | OCF_PREVENTCONCATBACKWARD));
+			SetSelWithoutSelection(m_posActive.iLine, iCharOrg);
+			return true;
+		}
+	}
+*/
+	return false;
+}
+#endif /* 0 */
+
+/// 描画の凍結を解く
+/// @see EditView::freeze, EditView::isFreezed
+void EditView::unfreeze() {
+	assertValidAsWindow();
+	FOR_EACH_CLONES() {
+		if(it->freezeInfo_.count > 0) {
+			if(--it->freezeInfo_.count == 0)
+				it->doUnfreeze();
+		}
+	}
+}
+
+/// 現在の設定を使って GDI オブジェクトを更新
+void EditView::updateGDIObjects() {
+	SharedData::GDIObjects& gdiObjects = sharedData_->gdiObjects;
+	const LayoutSetter& layoutManager = getLayoutSetter();
+	const LayoutSettings& layout = layoutManager.getSettings();
+
+	::DeleteObject(gdiObjects.caretLinePen);
+	gdiObjects.caretLinePen = ::CreatePen(PS_SOLID, 1,
+		(layout.caretLineColor != -1) ? layout.caretLineColor : ::GetSysColor(COLOR_HIGHLIGHT));
+
+	::DeleteObject(gdiObjects.inactiveCaretLinePen);
+	gdiObjects.inactiveCaretLinePen = ::CreatePen(PS_SOLID, 1,
+		(layout.inactiveCaretLineColor != -1) ? layout.inactiveCaretLineColor : ::GetSysColor(COLOR_INACTIVECAPTION));
+
+	::DeleteObject(gdiObjects.indicatorMarginPen);
+	gdiObjects.indicatorMarginPen =
+		::CreatePen(PS_SOLID, 1, layoutManager.getTokenFoundation(ETT_INDICATOR_MARGIN, Token::NULL_COOKIE).fgColor);
+
+	// 行番号の区切り線を描くペン
+	::DeleteObject(gdiObjects.lineNumberPen);
+	if(layout.lineNumberLayout.showLineNumbers) {
+		if(layout.lineNumberLayout.borderStyle == LineNumberLayout::LNBS_NONE
+				|| layout.lineNumberLayout.borderStyle == LineNumberLayout::LNBS_SOLID)	// 実線
+			gdiObjects.lineNumberPen =
+				::CreatePen(PS_SOLID, layout.lineNumberLayout.borderWidth,
+					layoutManager.getTokenFoundation(ETT_LINENUMBER, Token::NULL_COOKIE).fgColor);
+		else {
+			LOGBRUSH brush;
+			brush.lbColor = layoutManager.getTokenFoundation(ETT_LINENUMBER, Token::NULL_COOKIE).fgColor;
+			brush.lbStyle = BS_SOLID;
+			if(layout.lineNumberLayout.borderStyle == LineNumberLayout::LNBS_DASHED)	// 破線
+				gdiObjects.lineNumberPen = ::ExtCreatePen(
+					PS_GEOMETRIC | PS_DASH | PS_ENDCAP_FLAT, layout.lineNumberLayout.borderWidth, &brush, 0, 0);
+			else if(layout.lineNumberLayout.borderStyle == LineNumberLayout::LNBS_DASHED_ROUNDED)	// 丸破線
+				gdiObjects.lineNumberPen = ::ExtCreatePen(
+					PS_GEOMETRIC | PS_DASH | PS_ENDCAP_ROUND, layout.lineNumberLayout.borderWidth, &brush, 0, 0);
+			else if(layout.lineNumberLayout.borderStyle == LineNumberLayout::LNBS_DOTTED)	// 点線
+				gdiObjects.lineNumberPen = ::ExtCreatePen(
+					PS_GEOMETRIC | PS_DOT, layout.lineNumberLayout.borderWidth, &brush, 0, 0);
+		}
+	}
+
+	::DeleteObject(gdiObjects.lineTerminatorPen);
+	gdiObjects.lineTerminatorPen =
+		::CreatePen(PS_SOLID, 1, layoutManager.getTokenFoundation(ETT_END_OF_LINE, Token::NULL_COOKIE).fgColor);
+
+	::DeleteObject(gdiObjects.restrictedLineTerminatorPen);
+	gdiObjects.restrictedLineTerminatorPen =
+		::CreatePen(PS_SOLID, 1, layoutManager.getTokenFoundation(ETT_RESTRICTION, Token::NULL_COOKIE).fgColor);
+}
+
+#ifndef ASCENSION_NO_DOUBLE_BUFFERING
+/// 1描画用の互換デバイスコンテキストの更新
+void EditView::updateMemoryDeviceContext() {
+	if(memDC_.getSafeHdc() == 0)	// まだ準備ができてない...
+		return;
+
+	BITMAP bitmap;
+	bool needRecreate = false;
+	RECT rect;
+
+	getClientRect(rect);
+	if(::GetObject(lineBitmap_, sizeof(BITMAP), &bitmap) != 0) {
+		if(bitmap.bmWidth < rect.right - rect.left	// 既存のビットマップが小さい場合
+				|| bitmap.bmHeight < sharedData_->layoutManager.getLineHeight())
+			needRecreate = true;
+		else if(bitmap.bmWidth / 2 > rect.right - rect.left	// 既存のビットマップが大きすぎる場合
+				|| bitmap.bmHeight / 2 > sharedData_->layoutManager.getLineHeight())
+			needRecreate = true;
+	} else
+		needRecreate = true;
+
+	if(needRecreate) {
+		memDC_.selectObject(oldLineBitmap_);
+		::DeleteObject(lineBitmap_);
+		lineBitmap_ = ::CreateCompatibleBitmap(getDC().getSafeHdc(),
+			rect.right - rect.left + 20, sharedData_->layoutManager.getLineHeight());	// 少し大きめに...
+		memDC_.selectObject(lineBitmap_);
+	}
+}
+#endif /* !ASCENSION_NO_DOUBLE_BUFFERING */
+
+/// 現在位置とスクロール状況、フォント情報などからキャレットを適切な位置に移動
+void EditView::updateCaretPosition() {
+	if(!hasFocus() || isFreezed())
+		return;
+
+	POINT pt = posFromChar(selection_->getActivePoint());
+	const LineLayoutManager& layout = sharedData_->layoutManager;
+
+	// キャレットを「隠す」
+	if(pt.y < static_cast<long>(layout.getSettings().topMargin))
+		pt.y = -static_cast<long>(layout.getLineHeight());
+	else if(!layout.getSettings().rightAlign
+			&& pt.x < static_cast<long>(layout.getVerticalRulerWidth() + layout.getSettings().leadMargin))
+		pt.x = -static_cast<long>(layout.getAverageCharacterWidth());
+	else if(layout.getSettings().rightAlign) {
+		RECT clientRect;
+		getClientRect(clientRect);
+		if(pt.x > clientRect.right - static_cast<long>(layout.getVerticalRulerWidth() + layout.getSettings().leadMargin))
+			pt.x = -static_cast<long>(layout.getAverageCharacterWidth());
+	}
+
+	if(!modeState_.overtype || !selection_->isEmpty()) {
+		--pt.x;
+		if(sharedData_->options.appearance[LOCALE_SPECIFIC_CARET_SHAPE]) {
+			// RTL キャレットはホットスポットがずれている (EditView::recreateCaret と createRTLCaretBitmap 参照)
+			if(isRTLLanguage(PRIMARYLANGID(LOWORD(::GetKeyboardLayout(::GetCurrentThreadId())))))
+				pt.x -= 3;
+		}
+	} else {
+		const CharPos caret = selection_->getActivePoint();
+		const LineLayout::Runs& runs = layout.getLine(caret.line_).getRuns();
+		for(size_t i = 0; ; ++i) {
+			if(i == runs.getCount() - 1
+					|| caret.char_ >= runs.getAt(i).getIndex() && caret.char_ < runs.getAt(i + 1).getIndex()) {
+				if(runs.getAt(i).isRightToLeft())
+					pt.x -= sharedData_->caretWidth;
+				break;
+			}
+		}
+	}
+	setCaretPos(pt);
+}
+
+/// IME フォームを正しい位置に移動
+void EditView::updateIMECompositionWindowPosition() {
+	assertValidAsWindow();
+	if(!imeCompositionActivated_)
+		return;
+
+	COMPOSITIONFORM cf;
+	HIMC imc = ::ImmGetContext(getHandle());
+
+	if(imc != 0) {
+		cf.dwStyle = CFS_POINT;
+		cf.ptCurrentPos = posFromChar(selection_->getStartPoint());
+	//	cf.ptCurrentPos.x -= 1;
+		cf.ptCurrentPos.y -= 1;
+		::ImmSetCompositionWindow(imc, &cf);
+		::ImmReleaseContext(getHandle(), imc);
+	}
+}
+
+/**
+ *	水平、垂直スクロールバーの情報を更新する
+ *	@param horizontal	水平スクロールバーを更新する場合 true
+ *	@param vertical		垂直スクロールバーを更新する場合 true
+ */
+void EditView::updateScrollInfo(bool horizontal, bool vertical) {
+	assertValidAsWindow();
+
+/*	if(isFreezed()) {	// 後で解凍時に呼び出す
+		if(horizontal)	freezeInfo_.needUpdateScrollInfo.x = true;
+		if(vertical)	freezeInfo_.needUpdateScrollInfo.y = true;
+		return;
+	}
+*/
+#define IS_SCROLLBAR_NEEDED(ratio)	((scroll.nMax - scroll.nMin) * ratio > scroll.nPage)
+
+	const EditDoc& document = getDocument();
+	const LineLayoutManager& layoutManager = sharedData_->layoutManager;
+	const LayoutSettings& layout = getLayoutSetter().getSettings();
+	AutoZeroCB<SCROLLINFO> scroll;
+	const length_t lineCount = getDisplayLineCount();
+
+	// 垂直スクロールバー
+	if(vertical) {
+		scrollInfo_.verticalRatio = static_cast<ulong>(lineCount) / numeric_limits<int>::max() + 1;
+		assert(scrollInfo_.verticalRatio != 0);
+		getScrollInfo(SB_VERT, scroll);
+		const bool wasNeededScrollbar = IS_SCROLLBAR_NEEDED(scrollInfo_.verticalRatio);
+		scroll.fMask = SIF_DISABLENOSCROLL | SIF_PAGE | SIF_RANGE;
+		scroll.nMax = static_cast<int>(lineCount / scrollInfo_.verticalRatio - 1);
+		scroll.nPage = static_cast<int>(getVisibleLineCount());
+
+		// スクロールバーが無くなる前に上端にスクロールさせる...
+		if(wasNeededScrollbar && !IS_SCROLLBAR_NEEDED(scrollInfo_.verticalRatio)) {
+			onVScroll(SB_TOP, 0, 0);
+			invalidateLines(0, -1);
+			updateCaretPosition();
+		}
+		setScrollInfo(SB_VERT, scroll, true);
+	}
+
+	// 水平スクロールバー
+	if(horizontal) {
+		assert(layoutManager.getAverageCharacterWidth() != 0);
+		const ulong maxPixelLength = (layout.wrapMode == WPM_NONE) ?
+			layoutManager.getLongestLineWidth() / layoutManager.getAverageCharacterWidth() : 0;
+		scrollInfo_.horizontalRatio = maxPixelLength / numeric_limits<int>::max() + 1;
+		assert(scrollInfo_.horizontalRatio != 0);
+		const bool wasNeededScrollbar = IS_SCROLLBAR_NEEDED(scrollInfo_.horizontalRatio);
+		scroll.fMask = SIF_DISABLENOSCROLL | SIF_PAGE | SIF_RANGE;
+		scroll.nMax = maxPixelLength / scrollInfo_.horizontalRatio;
+		scroll.nPage = static_cast<int>(getVisibleCharCount());
+		if(layout.rightAlign && getScrollPos(SB_HORZ) != mapInternalXToScrollBoxX(scrollInfo_.position.x)) {
+			scroll.fMask |= SIF_POS;
+			scroll.nPos = mapInternalXToScrollBoxX(scrollInfo_.position.x);
+		}
+
+		// スクロールバーが無くなる前に左端 (右端) にスクロールさせる...
+		if(wasNeededScrollbar && !IS_SCROLLBAR_NEEDED(scrollInfo_.horizontalRatio)) {
+			onHScroll(SB_LEFT, mapInternalXToScrollBoxX(0), 0);
+			invalidateLines(0, -1);
+			updateCaretPosition();
+		}
+		setScrollInfo(SB_HORZ, scroll, true);
+	}
+
+#undef IS_SCROLLBAR_NEEDED
+}
+
+/// 行選択の開始
+/// @see Selection::beginWordSelection, Selection::getLineSelectionAnchorLine
+void EditView::Selection::beginLineSelection() {
+	temporaryAnchorLine_ = anchorPoint_->getLineNumber();
+}
+
+/// 単語選択の開始
+/// @see Selection::beginLineSelectionAnchorLine, Selection::getWordSelectionOriginalWord
+void EditView::Selection::beginWordSelection() {
+	temporaryAnchorLine_ = activePoint_->getLineNumber();
+	wordSelectionChars_[0] = anchorPoint_->getCharNumber();
+	wordSelectionChars_[1] = activePoint_->getCharNumber();
+}
+
+/// @see Selection::copy
+void EditView::Selection::copy(bool alsoSendToClipboardRing) {
+	if(isEmpty())
+		return;
+
+	WaitCursor wc;
+	const string_t str = getText(LBRP_PHYSICAL_DATA);
+
+	Private::Clipboard(view_).write(str, isRectangle());
+	if(alsoSendToClipboardRing)	// クリップボードリングにも転送
+		view_.getClipboardRing().add(str, isRectangle());
+}
+
+/// @see Selection::cut
+void EditView::Selection::cut(bool alsoSendToClipboardRing) {
+	if(view_.getDocument().isReadOnly())
+		return;
+	view_.closeCompletionWindow();
+	copy(alsoSendToClipboardRing);
+	view_.freeze();
+	view_.getDocument().beginEditCollection();
+	erase();
+	view_.getDocument().endEditCollection();
+	view_.unfreeze();
+}
+
+/// @see Selection::erase
+/// このメソッドは描画の凍結もアンドゥグループの作成も行わない
+void EditView::Selection::erase() {
+	EditDoc& document = view_.getDocument();
+	if(document.isReadOnly() || isEmpty())
+		return;
+
+	if(!isRectangle())	// 線形
+		moveTo(document.deleteText(*anchorPoint_, *activePoint_), true);
+	else {	// 矩形
+		const length_t topLine = getStartPoint().getLineNumber();
+		const length_t bottomLine = getEndPoint().getLineNumber();
+		const int left = min(boxSelectionAnchorX_, boxSelectionActiveX_);
+		const int right = max(boxSelectionAnchorX_, boxSelectionActiveX_);
+		CharPos resultPosition;
+
+		for(length_t line = topLine; line <= bottomLine; ++line)
+			resultPosition = document.deleteText(
+				CharPos(line, view_.mapAbsoluteXToCharacter(line,
+					left, !view_.sharedData_->options.behavior[ACCEPT_CARET_ON_EXTENDER_BY_MOUSE])),
+				CharPos(line, view_.mapAbsoluteXToCharacter(line,
+					right, !view_.sharedData_->options.behavior[ACCEPT_CARET_ON_EXTENDER_BY_MOUSE])));
+		Ascension::Selection::moveTo(resultPosition, true);
+	}
+	view_.setNextCharacterVariation(NCV_NONE);	// 元に戻す
+}
+
+/**
+ *	行選択開始時に選択されていた行番号を返す
+ *	@return	倫理行番号
+ *	@see	Selection::beginLineSelectionAnchorLine, Selection::getWordSelectionOriginalWord
+ */
+length_t EditView::Selection::getLineSelectionOriginalLine() const {
+	return temporaryAnchorLine_;
+}
+
+/// @see Selection::getRangeOnLine
+void EditView::Selection::getRangeOnLine(length_t line, length_t* startChar, length_t* endChar) const {
+	if(isEmpty()) {
+		if(startChar != 0)	*startChar = -1;
+		if(endChar != 0)	*endChar = -1;
+	} else if(!isRectangle()) {	// 線形
+		if(startChar != 0) {
+			if(line == getStartPoint().getLineNumber())
+				*startChar = getStartPoint().getCharNumber();
+			else
+				*startChar = (line < getStartPoint().getLineNumber()) ? -1 : 0;
+		}
+		if(endChar != 0) {
+			if(line == getEndPoint().getLineNumber())
+				*endChar = getEndPoint().getCharNumber();
+			else
+				*endChar = (line < getEndPoint().getLineNumber()) ? -1 : 0;
+		}
+	} else {	// 矩形
+		if(line >= getStartPoint().getLineNumber() && line <= getEndPoint().getLineNumber()) {
+			if(startChar != 0)
+				*startChar = view_.mapAbsoluteXToCharacter(line, boxSelectionAnchorX_,
+					!view_.sharedData_->options.behavior[ACCEPT_CARET_ON_EXTENDER_BY_MOUSE]);
+			if(endChar != 0)
+				*endChar = view_.mapAbsoluteXToCharacter(line, boxSelectionActiveX_,
+					!view_.sharedData_->options.behavior[ACCEPT_CARET_ON_EXTENDER_BY_MOUSE]);
+		} else {
+			if(startChar != 0)	*startChar = 0;
+			if(endChar != 0)	*endChar = 0;
+		}
+	}
+}
+
+/// @see Selection::getText
+string_t EditView::Selection::getText(LineBreakRetrievePolicy lineBreakPolicy) const {
+	if(isEmpty())
+		return L"";
+	else if(!isRectangle())	// 矩形選択でない場合
+		return getStartPoint().getText(getEndPoint(), lineBreakPolicy);
+
+	// 矩形選択の場合
+	ostringstream_t ss;
+	const EditDoc& document = view_.getDocument();
+	const CharPos bottom = getEndPoint();
+	length_t line = getStartPoint().getLineNumber();
+	const ulong xLeft = min(boxSelectionAnchorX_, boxSelectionActiveX_);
+	const ulong xRight = max(boxSelectionAnchorX_, boxSelectionActiveX_);
+
+	for(length_t line = getStartPoint().getLineNumber(); line < bottom.line_; ++line) {
+		length_t begin = view_.mapAbsoluteXToCharacter(line, xLeft,
+			!view_.sharedData_->options.behavior[ACCEPT_CARET_ON_EXTENDER_BY_MOUSE]);
+		ss << document.getLine(line).substr(begin, view_.mapAbsoluteXToCharacter(line, xRight,
+				!view_.sharedData_->options.behavior[ACCEPT_CARET_ON_EXTENDER_BY_MOUSE]) - begin);
+		ss << EditDoc::getLineBreakString(document.getLineInfo(line).getLineBreak());
+	}
+	return ss.str();
+}
+
+/**
+ *	単語選択開始時に選択されていた単語の位置を返す
+ *	@param word	[out] 単語の範囲
+ *	@see		Selection::beginWordSelection, Selection::getLineSelectionOriginalLine
+ */
+void EditView::Selection::getWordSelectionOriginalWord(TextRange& word) const {
+	word.pos1_ = CharPos(temporaryAnchorLine_, wordSelectionChars_[0]);
+	word.pos2_ = CharPos(temporaryAnchorLine_, wordSelectionChars_[1]);
+}
+
+/// @see Selection::isPointOver
+bool EditView::Selection::isPointOver(const POINT& pt) const {
+	assert(view_.isWindow());
+
+	const LineLayoutManager& layoutManager = view_.sharedData_->layoutManager;
+	const LayoutSettings& layout = view_.getLayoutSetter().getSettings();
+	const HitTestResult htr = view_.hitTest(pt);
+
+	// 選択が無かったり、マージン上であれば無視
+	if(isEmpty() || htr != HTR_TEXT)
+		return false;
+
+	RECT rect;
+
+	view_.getClientRect(rect);
+	if(pt.x > rect.right || pt.y > rect.bottom)
+		return false;
+	
+	const CharPos pos = view_.charFromPos(pt,
+		!view_.sharedData_->options.behavior[ACCEPT_CARET_ON_EXTENDER_BY_MOUSE]);
+
+	if(!isRectangle())	// 線形
+		return getStartPoint().getPosition() <= pos && getEndPoint().getPosition() >= pos;
+	else {	// 矩形
+		const int xView = view_.mapClientXToAbsoluteX(pt.x, layoutManager.getLine(pos.line_).getWidth());
+		const length_t displayLine =
+			view_.scrollInfo_.getY() + (pt.y - layout.topMargin) / layoutManager.getLineHeight();
+		return xView >= min(boxSelectionAnchorX_, boxSelectionActiveX_)
+			&& xView <= max(boxSelectionAnchorX_, boxSelectionActiveX_)
+			&& displayLine >= min(temporaryAnchorLine_, boxSelectionActiveLine_)
+			&& displayLine <= max(temporaryAnchorLine_, boxSelectionActiveLine_);
+	}
+}
+
+/// @see Caret::IEventListener::onCaretMoved
+void EditView::Selection::onCaretMoved(const Caret& self,
+		const VisualPoint& anchor, const TextRange& oldRange, bool forDocumentUpdate) {
+	// self はアクティブポイント (コンストラクタ参照)
+	if(ignoreActiveMovement_)
+		ignoreActiveMovement_ = false;
+	else {
+		updateRectangleRegion();
+		view_.onSelectionChanged(oldRange, isRectangle(), &self == activePoint_, forDocumentUpdate);
+	}
+}
+
+/// @see Selection::paste
+void EditView::Selection::paste(bool fromClipboardRing) {
+	if(view_.getDocument().isReadOnly()
+			|| (fromClipboardRing && view_.getClipboardRing().getCount() == 0))
+		return;
+
+	view_.closeCompletionWindow();
+	view_.getDocument().beginEditCollection();	// 矩形貼り付けは複数ステップになる可能性がある
+	view_.freeze();
+
+	if(!fromClipboardRing) {
+		activePoint_->paste(*anchorPoint_);
+		Ascension::Selection::moveTo(*activePoint_, true);
+	} else {
+		string_t				str;
+		bool					box;
+		ClipboardRing::SizeType	activeItem = view_.getClipboardRing().getActiveItem();
+
+		if(toBoolean(type_ & PASTING_FROM_CLIPBOARD_RING)
+				&& ++activeItem == view_.getClipboardRing().getCount())
+			activeItem = 0;
+		view_.getClipboardRing().getText(activeItem, str, box);
+		view_.getClipboardRing().setActiveItem(activeItem);
+		if(!isEmpty()) {
+			if(toBoolean(type_ & PASTING_FROM_CLIPBOARD_RING))
+				view_.getDocument().undo();
+			erase();
+		}
+		if(!box)
+			activePoint_->insert(str);
+		else
+			activePoint_->insertBox(str);
+		type_ = static_cast<Type>(type_ | PASTING_FROM_CLIPBOARD_RING);
+	}
+	view_.getDocument().endEditCollection();
+	view_.unfreeze();
+}
+
+/**
+ *	@brief 選択テキストの置換
+ *
+ *	このメソッドはアンドゥグループを作成し、キャレットが可視になるようにビューをスクロールする
+ *	@see Selection::replace
+ */
+void EditView::Selection::replace(const char_t* first, const char_t* last, bool rectangleInsertion /* = false */) {
+	if(view_.getDocument().isReadOnly())
+		return;
+	view_.nextCharVariation_ = NCV_NONE;
+	view_.getDocument().beginEditCollection();
+	view_.freeze();
+	if(!isEmpty())
+		erase();
+	if(rectangleInsertion)
+		activePoint_->insertBox(first, last);
+	else
+		activePoint_->insert(first, last);
+	view_.unfreeze();
+	view_.getDocument().endEditCollection();
+}
+
+/// @see Selection::select
+void EditView::Selection::select(
+		const CharPos& anchorPosition, const CharPos& activePosition, bool rectangle, bool reveal) {
+	if(anchorPosition != *anchorPoint_
+			|| activePosition != *activePoint_
+			|| rectangle != isRectangle()
+			|| reveal) {
+		const TextRange oldRange(*anchorPoint_, *activePoint_);
+		const bool wasRectangle = isRectangle();
+		ignoreActiveMovement_ = true;
+		anchorPoint_->moveTo(anchorPosition);
+		activePoint_->moveTo(activePosition);
+		ignoreActiveMovement_ = false;	// 呼び出し先 (onEditPointMoved) で自動的に元に戻らない場合がある
+		type_ = rectangle ? Selection::RECTANGLE : Selection::LINEAR;
+		updateRectangleRegion();
+		view_.onSelectionChanged(oldRange, wasRectangle, reveal, false);
+	}
+}
+
+/// 矩形選択の範囲を更新する (このメソッドは EditView::onSelectionChanged を呼び出さない)
+void EditView::Selection::updateRectangleRegion() {
+	if(isRectangle()) {
+		temporaryAnchorLine_ = view_.displayLineFromLogicalLine(anchorPoint_->getLineNumber());
+		boxSelectionActiveLine_ = view_.displayLineFromLogicalLine(activePoint_->getLineNumber());
+		boxSelectionAnchorX_ = view_.sharedData_->layoutManager.getLine(
+			anchorPoint_->getLineNumber()).getCaretPosition(anchorPoint_->getCharNumber());
+		boxSelectionActiveX_ = view_.sharedData_->layoutManager.getLine(
+			activePoint_->getLineNumber()).getCaretPosition(activePoint_->getCharNumber());
+	}
+}
+
+
+// EditView::AccessibleProxy class implementation
+/////////////////////////////////////////////////////////////////////////////
+
+#ifndef ASCENSION_NO_ACTIVE_ACCESSIBILITY
+#define VERIFY_AVAILABILITY()	\
+	if(!available_) return RPC_E_DISCONNECTED
+
+/// コンストラクタ
+EditView::AccessibleProxy::AccessibleProxy(EditView& view) throw() : view_(view), available_(true) {
+	assert(accLib.isAvailable());
+	accLib.createStdAccessibleObject(view, OBJID_CLIENT, IID_IAccessible, reinterpret_cast<void**>(&defaultServer_));
+}
+
+/// @see IAccessible::accDoDefaultAction
+STDMETHODIMP EditView::AccessibleProxy::accDoDefaultAction(VARIANT) {
+	VERIFY_AVAILABILITY();
+	return DISP_E_MEMBERNOTFOUND;
+}
+
+/// @see IAccessible::accHitTest
+STDMETHODIMP EditView::AccessibleProxy::accHitTest(long xLeft, long yTop, VARIANT* pvarChild) {
+	VERIFY_AVAILABILITY();
+	// ウィンドウが矩形であることを前提としている
+	VERIFY_POINTER(pvarChild);
+	POINT pt = {xLeft, yTop};
+	RECT rect;
+	view_.getClientRect(rect);
+	view_.clientToScreen(rect);
+	if(toBoolean(::PtInRect(&rect, pt))) {
+		pvarChild->vt = VT_I4;
+		pvarChild->lVal = CHILDID_SELF;
+		return S_OK;
+	} else {
+		pvarChild->vt = VT_EMPTY;
+		return S_FALSE;
+	}
+}
+
+/// @see IAccessible::accLocation
+STDMETHODIMP EditView::AccessibleProxy::accLocation(long* pxLeft, long* pyTop, long* pcxWidth, long* pcyHeight, VARIANT varChild) {
+	VERIFY_AVAILABILITY();
+	VERIFY_POINTER(pxLeft);
+	VERIFY_POINTER(pyTop);
+	VERIFY_POINTER(pcxWidth);
+	VERIFY_POINTER(pcyHeight);
+	if(varChild.vt != VT_I4 || varChild.lVal != CHILDID_SELF)
+		return E_INVALIDARG;
+	RECT rect;
+	view_.getClientRect(rect);
+	view_.clientToScreen(rect);
+	*pxLeft = rect.left;
+	*pyTop = rect.top;
+	*pcxWidth = rect.right - rect.left;
+	*pcyHeight = rect.bottom - rect.top;
+	return S_OK;
+}
+
+/// @see IAccessible::accNavigate
+STDMETHODIMP EditView::AccessibleProxy::accNavigate(long navDir, VARIANT varStart, VARIANT* pvarEndUpAt) {
+	VERIFY_AVAILABILITY();
+	return defaultServer_->accNavigate(navDir, varStart, pvarEndUpAt);
+}
+
+/// @see IAccessible::accSelect
+STDMETHODIMP EditView::AccessibleProxy::accSelect(long flagsSelect, VARIANT varChild) {
+	VERIFY_AVAILABILITY();
+	return (varChild.vt == VT_I4 && varChild.lVal == CHILDID_SELF) ?
+		defaultServer_->accSelect(flagsSelect, varChild) : E_INVALIDARG;
+}
+
+/// ビューが利用不能になったことをプロクシに通知する
+void EditView::AccessibleProxy::dispose() {
+	if(!available_)
+		throw logic_error("This proxy is already disposed.");
+	available_ = false;
+}
+
+/// @see IAccessible::get_accChild
+STDMETHODIMP EditView::AccessibleProxy::get_accChild(VARIANT varChild, IDispatch** ppdispChild) {
+	VERIFY_AVAILABILITY();
+	VERIFY_POINTER(ppdispChild);
+	*ppdispChild = 0;
+	return S_OK;
+}
+
+/// @see IAccessible::get_accChildCount
+STDMETHODIMP EditView::AccessibleProxy::get_accChildCount(long* pcountChildren) {
+	VERIFY_AVAILABILITY();
+	VERIFY_POINTER(pcountChildren);
+	*pcountChildren = 0;
+	return S_OK;
+}
+
+/// @see IAccessible::get_accDefaultAction
+STDMETHODIMP EditView::AccessibleProxy::get_accDefaultAction(VARIANT, BSTR*) {
+	VERIFY_AVAILABILITY();
+	return DISP_E_MEMBERNOTFOUND;
+}
+
+/// @see IAccessible::get_accDescription
+STDMETHODIMP EditView::AccessibleProxy::get_accDescription(VARIANT, BSTR*) {
+	VERIFY_AVAILABILITY();
+	return DISP_E_MEMBERNOTFOUND;
+}
+
+/// @see IAccessible::get_accFocus
+STDMETHODIMP EditView::AccessibleProxy::get_accFocus(VARIANT* pvarChild) {
+	VERIFY_AVAILABILITY();
+	VERIFY_POINTER(pvarChild);
+	pvarChild->vt = VT_I4;
+	pvarChild->lVal = CHILDID_SELF;
+	return S_OK;
+}
+
+/// @see IAccessible::get_accHelp
+STDMETHODIMP EditView::AccessibleProxy::get_accHelp(VARIANT, BSTR*) {
+	VERIFY_AVAILABILITY();
+	return DISP_E_MEMBERNOTFOUND;
+}
+
+/// @see IAccessible::get_accHelpTopic
+STDMETHODIMP EditView::AccessibleProxy::get_accHelpTopic(BSTR*, VARIANT, long*) {
+	VERIFY_AVAILABILITY();
+	return DISP_E_MEMBERNOTFOUND;
+}
+
+/// @see IAccessible::get_accKeyboardShortcut
+STDMETHODIMP EditView::AccessibleProxy::get_accKeyboardShortcut(VARIANT varChild, BSTR* pszKeyboardShortcut) {
+	VERIFY_AVAILABILITY();
+	VERIFY_POINTER(pszKeyboardShortcut);
+	*pszKeyboardShortcut = 0;
+	if(varChild.vt != VT_I4 || varChild.lVal != CHILDID_SELF)
+		return E_INVALIDARG;
+	return S_FALSE;
+}
+
+/// @see IAccessible::get_accName
+STDMETHODIMP EditView::AccessibleProxy::get_accName(VARIANT varChild, BSTR* pszName) {
+	VERIFY_AVAILABILITY();
+	VERIFY_POINTER(pszName);
+	*pszName = 0;
+	if(varChild.vt != VT_I4 || varChild.lVal != CHILDID_SELF)
+		return E_INVALIDARG;
+	return S_FALSE;
+}
+
+/// @see IAccessible::get_accParent
+STDMETHODIMP EditView::AccessibleProxy::get_accParent(IDispatch** ppdispParent) {
+	VERIFY_AVAILABILITY();
+	if(accLib.isAvailable())
+		return accLib.accessibleObjectFromWindow(view_, OBJID_WINDOW, IID_IAccessible, reinterpret_cast<void**>(ppdispParent));
+	return defaultServer_->get_accParent(ppdispParent);
+}
+
+/// @see IAccessible::get_accRole
+STDMETHODIMP EditView::AccessibleProxy::get_accRole(VARIANT varChild, VARIANT* pvarRole) {
+	VERIFY_AVAILABILITY();
+	VERIFY_POINTER(pvarRole);
+	if(varChild.vt != VT_I4 || varChild.lVal != CHILDID_SELF)
+		return E_INVALIDARG;
+	pvarRole->vt = VT_I4;
+	pvarRole->lVal = ROLE_SYSTEM_TEXT;
+	return S_OK;
+}
+
+/// @see IAccessible::get_accSelection
+STDMETHODIMP EditView::AccessibleProxy::get_accSelection(VARIANT* pvarChildren) {
+	VERIFY_AVAILABILITY();
+	VERIFY_POINTER(pvarChildren);
+	pvarChildren->vt = VT_EMPTY;
+	return S_FALSE;
+}
+
+/// @see IAccessible::get_accState
+STDMETHODIMP EditView::AccessibleProxy::get_accState(VARIANT varChild, VARIANT* pvarState) {
+	VERIFY_AVAILABILITY();
+	if(varChild.vt != VT_I4 || varChild.lVal != CHILDID_SELF)
+		return E_INVALIDARG;
+	pvarState->vt = VT_I4;
+	pvarState->lVal = 0;	// STATE_SYSTEM_NORMAL;
+	if(!view_.isWindowVisible())
+		pvarState->lVal |= STATE_SYSTEM_INVISIBLE;
+	if(view_.getTopWindow() == ::GetActiveWindow())
+		pvarState->lVal |= STATE_SYSTEM_FOCUSABLE;
+	if(view_.hasFocus())
+		pvarState->lVal |= STATE_SYSTEM_FOCUSED;
+	if(view_.getDocument().isReadOnly())
+		pvarState->lVal |= STATE_SYSTEM_READONLY;
+	return S_OK;
+}
+
+/// @see IAccessible::get_accValue
+STDMETHODIMP EditView::AccessibleProxy::get_accValue(VARIANT varChild, BSTR* pszValue) {
+	VERIFY_AVAILABILITY();
+	VERIFY_POINTER(pszValue);
+	if(varChild.vt != VT_I4 || varChild.lVal != CHILDID_SELF)
+		return E_INVALIDARG;
+	ostringstream_t s;
+	view_.getDocument().getAllLines(s);
+	*pszValue = ::SysAllocString(s.str().c_str());
+	return (*pszValue != 0) ? S_OK : E_OUTOFMEMORY;
+}
+
+/// @see EditDoc::IBufferListener::onDeleteText
+void EditView::AccessibleProxy::onDeleteText(const TextRange& range) {
+	assert(accLib.isAvailable());
+	accLib.notifyWinEvent(EVENT_OBJECT_VALUECHANGE, view_, OBJID_CLIENT, CHILDID_SELF);
+}
+
+/// @see EditDoc::IBufferListener::onInsertText
+void EditView::AccessibleProxy::onInsertText(const CharPos& at, const string_t& text) {
+	assert(accLib.isAvailable());
+	accLib.notifyWinEvent(EVENT_OBJECT_VALUECHANGE, view_, OBJID_CLIENT, CHILDID_SELF);
+}
+
+/// @see IAccessible::put_accName
+STDMETHODIMP EditView::AccessibleProxy::put_accName(VARIANT, BSTR) {
+	VERIFY_AVAILABILITY();
+	return DISP_E_MEMBERNOTFOUND;
+}
+
+/// @see IAccessible::put_accValue
+STDMETHODIMP EditView::AccessibleProxy::put_accValue(VARIANT varChild, BSTR szValue) {
+	VERIFY_AVAILABILITY();
+	if(varChild.vt != VT_I4 || varChild.lVal != CHILDID_SELF)
+		return E_INVALIDARG;
+	else if(view_.getDocument().isReadOnly())
+		return E_ACCESSDENIED;
+	view_.getSelection().replace(SAFE_BSTR(szValue));
+	return S_OK;
+}
+
+#endif /* !ASCENSION_NO_ACTIVE_ACCESSIBILITY */
+
+
+// Private::Clipboard class implementation
+/////////////////////////////////////////////////////////////////////////////
+
+/// クリップボードからテキストを読み取る
+Private::Clipboard::Text Private::Clipboard::read() throw() {
+	assert(isOpen());
+	if(HGLOBAL data = ::GetClipboardData(CF_UNICODETEXT))
+		return Text(data, static_cast<char_t*>(::GlobalLock(data)));
+	return Text(0, 0);
+}
+/// クリップボードにテキストを書き込む
+void Private::Clipboard::write(const char_t* first, const char_t* last, bool asRectangle /* = false */) throw() {
+	assert(isOpen());
+	if(HGLOBAL data = ::GlobalAlloc(GMEM_MOVEABLE, sizeof(char_t) * (last - first + 1))) {
+		if(char_t* buffer = static_cast<char_t*>(::GlobalLock(data))) {
+			uninitialized_copy(first, last, buffer);
+			::GlobalUnlock(data);
+			::EmptyClipboard();
+			::SetClipboardData(CF_UNICODETEXT, data);
+			if(asRectangle) {
+				if(const UINT clipFormat = ::RegisterClipboardFormat(ASCENSION_RECTANGLE_TEXT_CLIP_FORMAT)) {
+					data = ::GlobalAlloc(GMEM_MOVEABLE, 1);
+					buffer = static_cast<char_t*>(::GlobalLock(data));
+					buffer[0] = 0;
+					::GlobalUnlock(data);
+					::SetClipboardData(clipFormat, data);
+				}
+			}
+		}
+	}
+}
+
+/* [EOF] */
